@@ -30,6 +30,10 @@ Stop the job and its process tree:
 
 Background jobs are supervised by detached Node processes and store their state and logs under the system temporary directory. They survive independent tool calls, `/reload`, and pi restarts. Finished records become eligible for opportunistic cleanup after 24 hours.
 
+## TUI display
+
+Tool calls render with syntax-highlighted Python code (collapsed to the first 10 lines; expand with the tool-expand keybinding). While executing, the output streams live and is previewed as the last few visual lines. Background job results show a status header (job id, status, pid, exit code) instead of the raw metadata block, and foreground runs show their duration.
+
 ## Requirements
 
 - Node.js 22.19 or newer
