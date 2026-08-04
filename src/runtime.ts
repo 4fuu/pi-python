@@ -109,22 +109,17 @@ async function probe(executable: string, prefixArgs: string[]): Promise<Interpre
 	});
 }
 
+const INTERPRETER_CANDIDATES = [
+	{ executable: "python3", prefixArgs: [] },
+	{ executable: "python", prefixArgs: [] },
+];
+
 async function findInterpreter(): Promise<Interpreter> {
-	const candidates =
-		process.platform === "win32"
-			? [
-					{ executable: "python", prefixArgs: [] },
-					{ executable: "py", prefixArgs: ["-3"] },
-				]
-			: [
-					{ executable: "python3", prefixArgs: [] },
-					{ executable: "python", prefixArgs: [] },
-				];
-	for (const candidate of candidates) {
+	for (const candidate of INTERPRETER_CANDIDATES) {
 		const found = await probe(candidate.executable, candidate.prefixArgs);
 		if (found) return found;
 	}
-	throw new Error("python: Python 3 was not found (tried python3/python, or python/py -3 on Windows)");
+	throw new Error("python: Python 3 was not found (tried python3 and python on PATH)");
 }
 
 function isAlive(pid: number): boolean {

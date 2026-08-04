@@ -33,7 +33,7 @@ Background jobs are supervised by detached Node processes and store their state 
 ## Requirements
 
 - Node.js 22.19 or newer
-- Python 3 available as `python3` or `python` on Unix, or `python` or `py -3` on Windows
+- Python 3 available as `python3` or `python` on PATH
 
 ## Installation
 

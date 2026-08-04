@@ -38,7 +38,7 @@ describe("python extension", () => {
 		assert.equal(tool.name, "python");
 		assert.equal(tool.promptSnippet, "Execute Python code and manage persistent background Python jobs");
 		assert.deepEqual(tool.promptGuidelines, [
-			"Use python for Python-specific computation, data processing, or libraries; run long-lived programs in the background, then use the returned jobId to read incremental output or stop them.",
+			"Use python for complex or otherwise suitable tasks; run long-lived programs in the background, then use the returned jobId to read incremental output or stop them.",
 		]);
 		assert.deepEqual(Object.keys(tool.parameters.properties), ["code", "background", "timeout", "jobId", "wait", "stop"]);
 		assert.equal(tool.executionMode, "sequential");
@@ -96,8 +96,16 @@ describe("python extension", () => {
 			const second = await runtime.readJob(job.id, 2);
 			assert.match(second.output, /second/);
 			assert.doesNotMatch(second.output, /first/);
-			assert.equal(second.metadata.status, "completed");
-			assert.equal(second.metadata.exitCode, 0);
+			// The supervisor records the terminal status asynchronously after the
+			// child exits, so it can lag the final output chunk; poll for it.
+			let final = second;
+			const deadline = Date.now() + 5000;
+			while (final.metadata.status === "running" && Date.now() < deadline) {
+				await new Promise((resolve) => setTimeout(resolve, 50));
+				final = await runtime.readJob(job.id);
+			}
+			assert.equal(final.metadata.status, "completed");
+			assert.equal(final.metadata.exitCode, 0);
 		} finally {
 			await rm(jobDir, { recursive: true, force: true });
 		}
@@ -107,11 +115,19 @@ describe("python extension", () => {
 		const { runtime, jobDir } = await temporaryRuntime();
 		try {
 			const job = await runtime.startBackground("print('persisted', flush=True)", process.cwd());
-			await new Promise((resolve) => setTimeout(resolve, 200));
 			const restored = new PythonRuntime({ jobDir });
-			const result = await restored.readJob(job.id, 1);
+			// A fresh runtime instance recovers the job from disk. The supervisor
+			// records the terminal status asynchronously after the output appears,
+			// so poll (accumulating consumed output) until the status settles.
+			const deadline = Date.now() + 5000;
+			let result = await restored.readJob(job.id, 1);
+			let output = result.output;
+			while (result.metadata.status === "running" && Date.now() < deadline) {
+				result = await restored.readJob(job.id, 1);
+				output += result.output;
+			}
 			assert.equal(result.metadata.status, "completed");
-			assert.match(result.output, /persisted/);
+			assert.match(output, /persisted/);
 		} finally {
 			await rm(jobDir, { recursive: true, force: true });
 		}

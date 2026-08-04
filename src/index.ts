@@ -135,7 +135,7 @@ export default function pythonExtension(pi: ExtensionAPI): void {
 		description: TOOL_DESCRIPTION,
 		promptSnippet: "Execute Python code and manage persistent background Python jobs",
 		promptGuidelines: [
-			"Use python for Python-specific computation, data processing, or libraries; run long-lived programs in the background, then use the returned jobId to read incremental output or stop them.",
+			"Use python for complex or otherwise suitable tasks; run long-lived programs in the background, then use the returned jobId to read incremental output or stop them.",
 		],
 		parameters: PythonParams,
 		executionMode: "sequential",
