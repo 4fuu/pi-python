@@ -9,9 +9,17 @@ import { PythonRuntime } from "../src/runtime.ts";
 function createHarness() {
 	let tool: Record<string, any> | undefined;
 	const handlers = new Map<string, Array<(...args: any[]) => unknown>>();
+	const renderers = new Map<string, (...args: any[]) => unknown>();
+	const messages: Array<{ message: unknown; options: unknown }> = [];
 	const pi = {
 		registerTool(definition: Record<string, any>) {
 			tool = definition;
+		},
+		registerMessageRenderer(name: string, renderer: (...args: any[]) => unknown) {
+			renderers.set(name, renderer);
+		},
+		sendMessage(message: unknown, options: unknown) {
+			messages.push({ message, options });
 		},
 		on(name: string, handler: (...args: any[]) => unknown) {
 			handlers.set(name, [...(handlers.get(name) ?? []), handler]);
@@ -19,7 +27,7 @@ function createHarness() {
 	};
 	pythonExtension(pi as any);
 	assert.ok(tool);
-	return { tool, handlers };
+	return { tool, handlers, renderers, messages };
 }
 
 async function execute(tool: Record<string, any>, params: Record<string, unknown>) {
@@ -34,15 +42,16 @@ async function temporaryRuntime() {
 
 describe("python extension", () => {
 	it("registers concise prompt metadata and the intended flat schema", () => {
-		const { tool } = createHarness();
+		const { tool, renderers } = createHarness();
 		assert.equal(tool.name, "python");
-		assert.equal(tool.promptSnippet, "Execute Python code and manage persistent background Python jobs");
+		assert.equal(tool.promptSnippet, "Execute Python scripts");
 		assert.deepEqual(tool.promptGuidelines, [
-			"Use python for complex or otherwise suitable tasks; run long-lived programs in the background, then use the returned jobId to read incremental output or stop them.",
+			"Use python for complex tasks and computation, both foreground and background.",
 		]);
-		assert.deepEqual(Object.keys(tool.parameters.properties), ["code", "background", "timeout", "jobId", "wait", "stop"]);
+		assert.deepEqual(Object.keys(tool.parameters.properties), ["code", "background", "notifyOn", "timeout", "jobId", "wait", "stop"]);
 		assert.equal(tool.executionMode, "sequential");
 		assert.match(tool.description, /Exactly one of code or jobId is required/);
+		assert.equal(renderers.has("pi-python-job-notification"), true);
 	});
 
 	it("runs foreground Python and reports non-zero exits as errors", async () => {
@@ -52,6 +61,26 @@ describe("python extension", () => {
 		assert.equal(result.details.exitCode, 0);
 		assert.equal(result.content[0].text, "hello from python");
 		await assert.rejects(execute(tool, { code: "raise RuntimeError('boom')" }), /RuntimeError: boom[\s\S]*exited with code 1/);
+	});
+
+	it("starts and closes session-scoped notification resources", async () => {
+		const { handlers } = createHarness();
+		const notifications: string[] = [];
+		const widgets: unknown[] = [];
+		const ctx = {
+			cwd: process.cwd(),
+			mode: "rpc",
+			hasUI: true,
+			sessionManager: { getSessionId: () => "extension-session" },
+			ui: {
+				notify: (message: string) => notifications.push(message),
+				setWidget: (_key: string, content: unknown) => widgets.push(content),
+			},
+		};
+		await handlers.get("session_start")?.[0]?.({}, ctx);
+		assert.deepEqual(notifications, []);
+		await handlers.get("session_shutdown")?.[0]?.({}, ctx);
+		assert.equal(widgets.at(-1), undefined);
 	});
 
 	it("terminates foreground execution on timeout", async () => {
@@ -78,6 +107,8 @@ describe("python extension", () => {
 		await assert.rejects(execute(tool, {}), /exactly one of code or jobId/);
 		await assert.rejects(execute(tool, { code: "print(1)", jobId: "py-12345678" }), /exactly one/);
 		await assert.rejects(execute(tool, { code: "print(1)", background: true, timeout: 1 }), /foreground/);
+		await assert.rejects(execute(tool, { code: "print(1)", notifyOn: "ready" }), /background=true/);
+		await assert.rejects(execute(tool, { code: "print(1)", background: true, notifyOn: "界".repeat(86) }), /256 UTF-8 bytes/);
 		await assert.rejects(execute(tool, { jobId: "py-12345678", wait: 1, stop: true }), /wait is not accepted/);
 	});
 

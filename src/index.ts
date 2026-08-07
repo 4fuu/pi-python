@@ -1,5 +1,6 @@
 import { Type } from "typebox";
 import {
+	getAgentDir,
 	highlightCode,
 	keyHint,
 	truncateToVisualLines,
@@ -7,17 +8,19 @@ import {
 	type Theme,
 } from "@earendil-works/pi-coding-agent";
 import { Container, Text, truncateToWidth } from "@earendil-works/pi-tui";
+import { loadConfig } from "./config.ts";
+import { JobNotificationManager, registerJobNotificationRenderer } from "./job-notifications.ts";
 import { PythonRuntime, type JobResult } from "./runtime.ts";
 
 const MAX_CAPTURE_BYTES = 50 * 1024;
 
 const TOOL_DESCRIPTION = `Execute Python 3 code in the current working directory, either in the foreground or as a persistent background job.
 
-Pass code to execute it. Foreground execution is the default and streams output until Python exits. Set background=true for long-running programs; the call returns immediately with a jobId, and the process continues across tool calls, /reload, and pi restarts.
+Pass code for foreground execution. Output streams until Python exits; use timeout when execution must be bounded.
 
-Pass jobId (without code) to read output produced since the previous read and get the current status. Set wait to briefly wait for new output or completion instead of polling repeatedly. Set stop=true with jobId to terminate the background process tree and return its final unread output.
+BACKGROUND JOBS: Set background=true for long-running programs. The job persists across tool calls, /reload, and pi restarts, and completion is reported automatically. Use notifyOn only when the next step depends on a literal readiness message. Pass jobId to read incremental output and status, optionally with wait; set stop=true to terminate the active process tree.
 
-Exactly one of code or jobId is required. timeout applies only to foreground code and terminates its process tree. wait and stop apply only to jobId. Python runs unbuffered with UTF-8 defaults. Output is limited to the most recent 50KB per result; completed job records become eligible for automatic cleanup after 24 hours.`;
+Exactly one of code or jobId is required. timeout applies only to foreground code; wait and stop apply only to jobId. Each result is limited to the latest 50KB.`;
 
 const PythonParams = Type.Object(
 	{
@@ -30,6 +33,13 @@ const PythonParams = Type.Object(
 		background: Type.Optional(
 			Type.Boolean({
 				description: "Run code as a persistent background job and return a jobId immediately. Defaults to false.",
+			}),
+		),
+		notifyOn: Type.Optional(
+			Type.String({
+				minLength: 1,
+				maxLength: 256,
+				description: "With background=true, request a one-time readiness notification when this literal text appears in output.",
 			}),
 		),
 		timeout: Type.Optional(
@@ -202,6 +212,7 @@ function updateCodeHighlightCacheIncremental(cache: CodeHighlightCache | undefin
 type PythonToolArgs = {
 	code?: string;
 	background?: boolean;
+	notifyOn?: string;
 	timeout?: number;
 	jobId?: string;
 	wait?: number;
@@ -210,7 +221,7 @@ type PythonToolArgs = {
 
 function formatPythonCodeCall(args: PythonToolArgs, expanded: boolean, theme: Theme, cache: CodeHighlightCache | undefined): string {
 	let text = theme.fg("toolTitle", theme.bold("python"));
-	if (args.background) text += theme.fg("muted", " (background)");
+	if (args.background) text += theme.fg("muted", args.notifyOn ? ` (background · notify on ${JSON.stringify(args.notifyOn)})` : " (background)");
 	else if (args.timeout !== undefined) text += theme.fg("muted", ` (timeout ${args.timeout}s)`);
 
 	const code = typeof args.code === "string" ? args.code : "";
@@ -333,6 +344,7 @@ function rebuildPythonResultComponent(
 function assertValidCombination(params: {
 	code?: string;
 	background?: boolean;
+	notifyOn?: string;
 	timeout?: number;
 	jobId?: string;
 	wait?: number;
@@ -344,26 +356,44 @@ function assertValidCombination(params: {
 	if (params.code !== undefined) {
 		if (params.wait !== undefined) throw new Error("python: wait is accepted only with jobId");
 		if (params.stop !== undefined) throw new Error("python: stop is accepted only with jobId");
+		if (params.notifyOn !== undefined && !params.background) throw new Error("python: notifyOn requires background=true");
+		if (params.notifyOn !== undefined && (params.notifyOn.length === 0 || Buffer.byteLength(params.notifyOn, "utf8") > 256)) {
+			throw new Error("python: notifyOn must contain 1 to 256 UTF-8 bytes");
+		}
 		if (params.background && params.timeout !== undefined) {
 			throw new Error("python: timeout is accepted only for foreground execution");
 		}
 		return;
 	}
 	if (params.background !== undefined) throw new Error("python: background is accepted only with code");
+	if (params.notifyOn !== undefined) throw new Error("python: notifyOn is accepted only with background code");
 	if (params.timeout !== undefined) throw new Error("python: timeout is accepted only with foreground code");
 	if (params.stop && params.wait !== undefined) throw new Error("python: wait is not accepted when stop=true");
 }
 
 export default function pythonExtension(pi: ExtensionAPI): void {
-	const runtime = new PythonRuntime();
+	let runtime: PythonRuntime | undefined;
+	let setupError: string | undefined;
+	let notifications: JobNotificationManager | undefined;
+	try {
+		const { config } = loadConfig({ agentDir: getAgentDir() });
+		runtime = new PythonRuntime({
+			...(config.executable === "auto" ? {} : { interpreter: { executable: config.executable } }),
+			utf8: config.utf8,
+			unbuffered: config.unbuffered,
+		});
+	} catch (error) {
+		setupError = error instanceof Error ? error.message : String(error);
+	}
+	registerJobNotificationRenderer(pi);
 
 	pi.registerTool({
 		name: "python",
 		label: "Python",
 		description: TOOL_DESCRIPTION,
-		promptSnippet: "Execute Python code and manage persistent background Python jobs",
+		promptSnippet: "Execute Python scripts",
 		promptGuidelines: [
-			"Use python for complex or otherwise suitable tasks; run long-lived programs in the background, then use the returned jobId to read incremental output or stop them.",
+			"Use python for complex tasks and computation, both foreground and background.",
 		],
 		parameters: PythonParams,
 		executionMode: "sequential",
@@ -371,61 +401,73 @@ export default function pythonExtension(pi: ExtensionAPI): void {
 		async execute(_toolCallId, params, signal, onUpdate, ctx) {
 			signal?.throwIfAborted();
 			assertValidCombination(params);
+			if (!runtime) throw new Error(`python: ${setupError ?? "runtime configuration could not be loaded"}`);
+			const activeRuntime = runtime;
+			const releaseNotifications = notifications?.deferDuringToolCall() ?? (() => {});
+			try {
 
-			if (params.jobId !== undefined) {
-				const result = params.stop
-					? await runtime.stopJob(params.jobId)
-					: await runtime.readJob(params.jobId, params.wait ?? 0, signal);
-				return {
-					content: [{ type: "text" as const, text: jobText(result) }],
-					details: detailsForJob(result),
-				};
-			}
+				if (params.jobId !== undefined) {
+					const result = params.stop
+						? await activeRuntime.stopJob(params.jobId)
+						: await activeRuntime.readJob(params.jobId, params.wait ?? 0, signal);
+					return {
+						content: [{ type: "text" as const, text: jobText(result) }],
+						details: detailsForJob(result),
+					};
+				}
 
-			const code = params.code as string;
-			if (params.background) {
-				const metadata = await runtime.startBackground(code, ctx.cwd, signal);
-				const text = `Python job started.\njobId: ${metadata.id}\npid: ${metadata.pid}\nUse python with jobId="${metadata.id}" to read new output or stop it.`;
+				const code = params.code as string;
+				if (params.background) {
+					const metadata = await activeRuntime.startBackground(code, ctx.cwd, signal, params.notifyOn);
+					const text = [
+						"Python job started.",
+						`jobId: ${metadata.id}`,
+						`pid: ${metadata.pid}`,
+						...(params.notifyOn ? [`notifyOn: ${JSON.stringify(params.notifyOn)}`] : []),
+					].join("\n");
+					return {
+						content: [{ type: "text" as const, text }],
+						details: {
+							version: 1,
+							kind: "background",
+							status: "running",
+							jobId: metadata.id,
+							pid: metadata.pid,
+						} satisfies PythonDetails,
+					};
+				}
+
+				let captured: Buffer = Buffer.alloc(0);
+				let omitted = false;
+				const exitCode = await activeRuntime.runForeground({
+					code,
+					cwd: ctx.cwd,
+					timeout: params.timeout,
+					signal,
+					onData(chunk) {
+						const next = appendCaptured(captured, chunk);
+						captured = next.buffer;
+						omitted ||= next.omitted;
+						onUpdate?.({
+							content: [{ type: "text" as const, text: foregroundText(captured.toString("utf8"), omitted) }],
+							details: { version: 1, kind: "foreground", status: "running" } satisfies PythonDetails,
+						});
+					},
+				});
+				const output = foregroundText(captured.toString("utf8"), omitted, exitCode === 0 ? exitCode : undefined);
+				if (exitCode !== 0) throw new Error(`${output ? `${output}\n\n` : ""}Python exited with code ${exitCode}.`);
 				return {
-					content: [{ type: "text" as const, text }],
+					content: [{ type: "text" as const, text: output }],
 					details: {
 						version: 1,
-						kind: "background",
-						status: "running",
-						jobId: metadata.id,
-						pid: metadata.pid,
+						kind: "foreground",
+						status: "completed",
+						exitCode,
 					} satisfies PythonDetails,
 				};
+			} finally {
+				releaseNotifications();
 			}
-
-			let captured: Buffer = Buffer.alloc(0);
-			let omitted = false;
-			const exitCode = await runtime.runForeground({
-				code,
-				cwd: ctx.cwd,
-				timeout: params.timeout,
-				signal,
-				onData(chunk) {
-					const next = appendCaptured(captured, chunk);
-					captured = next.buffer;
-					omitted ||= next.omitted;
-					onUpdate?.({
-						content: [{ type: "text" as const, text: foregroundText(captured.toString("utf8"), omitted) }],
-						details: { version: 1, kind: "foreground", status: "running" } satisfies PythonDetails,
-					});
-				},
-			});
-			const output = foregroundText(captured.toString("utf8"), omitted, exitCode === 0 ? exitCode : undefined);
-			if (exitCode !== 0) throw new Error(`${output ? `${output}\n\n` : ""}Python exited with code ${exitCode}.`);
-			return {
-				content: [{ type: "text" as const, text: output }],
-				details: {
-					version: 1,
-					kind: "foreground",
-					status: "completed",
-					exitCode,
-				} satisfies PythonDetails,
-			};
 		},
 
 		renderCall(args, theme, context) {
@@ -493,7 +535,34 @@ export default function pythonExtension(pi: ExtensionAPI): void {
 		},
 	});
 
-	pi.on("session_start", async () => {
-		await runtime.cleanupExpired();
+	pi.on("session_shutdown", async () => {
+		const current = notifications;
+		notifications = undefined;
+		await current?.close();
+	});
+
+	pi.on("session_start", async (_event, ctx) => {
+		const current = notifications;
+		notifications = undefined;
+		await current?.close();
+		if (!runtime) {
+			ctx.ui.notify(`pi-python: ${setupError ?? "runtime configuration could not be loaded"}`, "error");
+			return;
+		}
+		runtime.setSessionId(ctx.sessionManager.getSessionId());
+		try {
+			await Promise.all([runtime.cleanupExpired(), runtime.interpreter()]);
+		} catch (error) {
+			ctx.ui.notify(`pi-python: ${error instanceof Error ? error.message : String(error)}`, "error");
+			return;
+		}
+		const manager = new JobNotificationManager(pi, ctx, runtime, ctx.sessionManager.getSessionId());
+		try {
+			await manager.start();
+			notifications = manager;
+		} catch (error) {
+			await manager.close();
+			ctx.ui.notify(`pi-python: job notification startup failed: ${error instanceof Error ? error.message : String(error)}`, "error");
+		}
 	});
 }

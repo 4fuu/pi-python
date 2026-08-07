@@ -1,6 +1,6 @@
 {
   "name": "@4fu/pi-python",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Execute Python code in pi with persistent background jobs",
   "license": "MIT",
   "author": "4fuu",

@@ -13,7 +13,7 @@ import {
 	writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { dirname, isAbsolute, join, normalize } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const SOURCE_DIR = dirname(fileURLToPath(import.meta.url));
@@ -22,16 +22,23 @@ const DEFAULT_JOB_DIR = join(tmpdir(), "pi-python-jobs");
 const JOB_RETENTION_MS = 24 * 60 * 60 * 1000;
 const MAX_OUTPUT_BYTES = 50 * 1024;
 const MAX_TIMEOUT_MS = 2_147_483_647;
+const EXIT_STDIO_GRACE_MS = 100;
+const MAX_NOTIFY_PATTERN_BYTES = 256;
 const JOB_ID_PATTERN = /^py-[0-9a-f]{8}$/;
+const JOB_STATUSES = new Set<JobStatus>(["starting", "running", "completed", "failed", "stopped"]);
 
 export type JobStatus = "starting" | "running" | "completed" | "failed" | "stopped";
 
 export interface JobMetadata {
-	version: 1;
+	version: 1 | 2;
 	id: string;
+	instanceId?: string;
+	sessionId?: string;
 	supervisorPid: number;
 	pid?: number;
 	cwd: string;
+	codeSummary?: string;
+	notifyOn?: string;
 	createdAt: string;
 	updatedAt: string;
 	status: JobStatus;
@@ -55,6 +62,9 @@ interface RuntimeOptions {
 	jobDir?: string;
 	launcherPath?: string;
 	interpreter?: { executable: string; prefixArgs?: string[] };
+	utf8?: boolean;
+	unbuffered?: boolean;
+	sessionId?: string;
 }
 
 interface ForegroundOptions {
@@ -65,27 +75,108 @@ interface ForegroundOptions {
 	onData: (data: Buffer) => void;
 }
 
-function runtimeEnvironment(): NodeJS.ProcessEnv {
-	return {
-		...process.env,
-		PYTHONIOENCODING: process.env.PYTHONIOENCODING ?? "utf-8",
-		PYTHONUTF8: process.env.PYTHONUTF8 ?? "1",
-		PYTHONUNBUFFERED: process.env.PYTHONUNBUFFERED ?? "1",
-	};
+function findEnvKey(env: NodeJS.ProcessEnv, name: string): string | undefined {
+	if (process.platform !== "win32") {
+		return Object.prototype.hasOwnProperty.call(env, name) ? name : undefined;
+	}
+	const normalized = name.toUpperCase();
+	return Object.keys(env).find((key) => key.toUpperCase() === normalized);
 }
 
+export function runtimeEnvironment(
+	config: { utf8: boolean; unbuffered: boolean },
+	baseEnv: NodeJS.ProcessEnv = process.env,
+): NodeJS.ProcessEnv {
+	const env = { ...baseEnv };
+	const defaults: Record<string, string> = {};
+	if (config.utf8) {
+		defaults.PYTHONIOENCODING = "utf-8";
+		defaults.PYTHONUTF8 = "1";
+	}
+	if (config.unbuffered) defaults.PYTHONUNBUFFERED = "1";
+	for (const [name, value] of Object.entries(defaults)) {
+		const existing = findEnvKey(env, name);
+		if (existing === undefined || env[existing] === undefined) env[name] = value;
+	}
+	return env;
+}
+
+/** Wait for process exit without hanging on pipe handles inherited by descendants. */
 function waitForExit(child: ChildProcess): Promise<number | null> {
 	return new Promise((resolve, reject) => {
-		child.once("error", reject);
-		child.once("close", resolve);
+		let settled = false;
+		let exited = false;
+		let exitCode: number | null = null;
+		let postExitTimer: NodeJS.Timeout | undefined;
+		let stdoutEnded = child.stdout === null;
+		let stderrEnded = child.stderr === null;
+
+		const cleanup = () => {
+			if (postExitTimer) clearTimeout(postExitTimer);
+			child.removeListener("error", onError);
+			child.removeListener("exit", onExit);
+			child.removeListener("close", onClose);
+			child.stdout?.removeListener("end", onStdoutEnd);
+			child.stderr?.removeListener("end", onStderrEnd);
+			child.stdout?.removeListener("data", onData);
+			child.stderr?.removeListener("data", onData);
+		};
+		const finish = (code: number | null) => {
+			if (settled) return;
+			settled = true;
+			cleanup();
+			child.stdout?.destroy();
+			child.stderr?.destroy();
+			resolve(code);
+		};
+		const maybeFinish = () => {
+			if (exited && stdoutEnded && stderrEnded) finish(exitCode);
+		};
+		const armIdleTimer = () => {
+			if (postExitTimer) clearTimeout(postExitTimer);
+			postExitTimer = setTimeout(() => finish(exitCode), EXIT_STDIO_GRACE_MS);
+		};
+		const onData = () => {
+			if (exited && !settled) armIdleTimer();
+		};
+		const onStdoutEnd = () => {
+			stdoutEnded = true;
+			maybeFinish();
+		};
+		const onStderrEnd = () => {
+			stderrEnded = true;
+			maybeFinish();
+		};
+		const onError = (error: Error) => {
+			if (settled) return;
+			settled = true;
+			cleanup();
+			reject(error);
+		};
+		const onExit = (code: number | null) => {
+			exited = true;
+			exitCode = code;
+			maybeFinish();
+			if (!settled) armIdleTimer();
+		};
+		const onClose = (code: number | null) => finish(code);
+
+		child.stdout?.once("end", onStdoutEnd);
+		child.stderr?.once("end", onStderrEnd);
+		child.stdout?.on("data", onData);
+		child.stderr?.on("data", onData);
+		child.once("error", onError);
+		child.once("exit", onExit);
+		child.once("close", onClose);
 	});
 }
 
 async function probe(executable: string, prefixArgs: string[]): Promise<Interpreter | undefined> {
 	return new Promise((resolve) => {
-		let output = "";
+		let stdout = "";
 		let settled = false;
-		const child = spawn(executable, [...prefixArgs, "--version"], {
+		const source = "import json, sys; print(json.dumps({'executable': sys.executable, 'version': '.'.join(map(str, sys.version_info[:3]))}))";
+		const child = spawn(executable, [...prefixArgs, "-c", source], {
 			stdio: ["ignore", "pipe", "pipe"],
 			windowsHide: true,
 		});
@@ -99,12 +190,24 @@ async function probe(executable: string, prefixArgs: string[]): Promise<Interpre
 			child.kill();
 			finish(undefined);
 		}, 5000);
-		child.stdout?.on("data", (data: Buffer) => (output += data.toString("utf8")));
-		child.stderr?.on("data", (data: Buffer) => (output += data.toString("utf8")));
+		child.stdout?.on("data", (data: Buffer) => (stdout += data.toString("utf8")));
 		child.once("error", () => finish(undefined));
 		child.once("close", (code) => {
-			const version = output.trim();
-			finish(code === 0 && /^Python 3(?:\.|\s|$)/.test(version) ? { executable, prefixArgs, version } : undefined);
+			if (code !== 0) return finish(undefined);
+			try {
+				const result = JSON.parse(stdout.trim()) as { executable?: unknown; version?: unknown };
+				if (
+					typeof result.executable !== "string" ||
+					!isAbsolute(result.executable) ||
+					typeof result.version !== "string" ||
+					!/^3(?:\.|$)/.test(result.version)
+				) {
+					return finish(undefined);
+				}
+				finish({ executable: normalize(result.executable), prefixArgs: [], version: `Python ${result.version}` });
+			} catch {
+				finish(undefined);
+			}
 		});
 	});
 }
@@ -183,18 +286,71 @@ async function killProcessTree(pid: number): Promise<void> {
 	if (isProcessGroupAlive(pid)) throw new Error(`python: process tree ${pid} did not terminate`);
 }
 
+function isTerminal(status: JobStatus): boolean {
+	return status !== "starting" && status !== "running";
+}
+
+function summarizeCode(code: string): string {
+	return code
+		.replace(/\r\n/g, "\n")
+		.replace(/\r/g, "\n")
+		.replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/g, "")
+		.replace(/\n/g, " ↵ ")
+		.slice(0, 2000);
+}
+
+function parseJobMetadata(value: unknown, id: string): JobMetadata {
+	if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("invalid metadata");
+	const input = value as Record<string, unknown>;
+	if ((input.version !== 1 && input.version !== 2) || input.id !== id) throw new Error("invalid metadata identity");
+	if (!Number.isInteger(input.supervisorPid) || (input.supervisorPid as number) < 0) throw new Error("invalid supervisor PID");
+	if (input.pid !== undefined && (!Number.isInteger(input.pid) || (input.pid as number) <= 0)) throw new Error("invalid process PID");
+	if (typeof input.cwd !== "string") throw new Error("invalid working directory");
+	if (typeof input.createdAt !== "string" || !Number.isFinite(Date.parse(input.createdAt))) throw new Error("invalid creation time");
+	if (typeof input.updatedAt !== "string" || !Number.isFinite(Date.parse(input.updatedAt))) throw new Error("invalid update time");
+	if (typeof input.status !== "string" || !JOB_STATUSES.has(input.status as JobStatus)) throw new Error("invalid status");
+	if (input.exitCode !== undefined && input.exitCode !== null && !Number.isInteger(input.exitCode)) throw new Error("invalid exit code");
+	if (input.error !== undefined && typeof input.error !== "string") throw new Error("invalid error");
+	if (input.version === 2) {
+		if (typeof input.instanceId !== "string" || !/^[0-9a-f]{32}$/i.test(input.instanceId)) throw new Error("invalid instance ID");
+		if (typeof input.sessionId !== "string") throw new Error("invalid session ID");
+		if (input.codeSummary !== undefined && (typeof input.codeSummary !== "string" || input.codeSummary.length > 2000)) {
+			throw new Error("invalid source summary");
+		}
+		if (
+			input.notifyOn !== undefined &&
+			(typeof input.notifyOn !== "string" ||
+				input.notifyOn.length === 0 ||
+				Buffer.byteLength(input.notifyOn, "utf8") > MAX_NOTIFY_PATTERN_BYTES)
+		) {
+			throw new Error("invalid readiness pattern");
+		}
+	}
+	return input as unknown as JobMetadata;
+}
+
 export class PythonRuntime {
 	readonly jobDir: string;
 	readonly launcherPath: string;
 	readonly configuredInterpreter?: { executable: string; prefixArgs: string[] };
+	readonly utf8: boolean;
+	readonly unbuffered: boolean;
+	#sessionId: string;
 	#interpreter?: Promise<Interpreter>;
 
 	constructor(options: RuntimeOptions = {}) {
 		this.jobDir = options.jobDir ?? DEFAULT_JOB_DIR;
 		this.launcherPath = options.launcherPath ?? DEFAULT_LAUNCHER_PATH;
+		this.utf8 = options.utf8 ?? true;
+		this.unbuffered = options.unbuffered ?? true;
+		this.#sessionId = options.sessionId ?? "";
 		this.configuredInterpreter = options.interpreter
 			? { executable: options.interpreter.executable, prefixArgs: options.interpreter.prefixArgs ?? [] }
 			: undefined;
+	}
+
+	setSessionId(sessionId: string): void {
+		this.#sessionId = sessionId;
 	}
 
 	async interpreter(): Promise<Interpreter> {
@@ -218,9 +374,10 @@ export class PythonRuntime {
 			const codePath = join(directory, "main.py");
 			await writeFile(codePath, options.code, "utf8");
 			options.signal?.throwIfAborted();
-			const child = spawn(interpreter.executable, [...interpreter.prefixArgs, "-u", codePath], {
+			const pythonArgs = [...interpreter.prefixArgs, ...(this.unbuffered ? ["-u"] : []), codePath];
+			const child = spawn(interpreter.executable, pythonArgs, {
 				cwd: options.cwd,
-				env: runtimeEnvironment(),
+				env: runtimeEnvironment(this),
 				stdio: ["ignore", "pipe", "pipe"],
 				windowsHide: true,
 				detached: process.platform !== "win32",
@@ -262,24 +419,42 @@ export class PythonRuntime {
 		}
 	}
 
-	async startBackground(code: string, cwd: string, signal?: AbortSignal): Promise<JobMetadata> {
+	async startBackground(code: string, cwd: string, signal?: AbortSignal, notifyOn?: string): Promise<JobMetadata> {
 		signal?.throwIfAborted();
+		if (notifyOn !== undefined && (notifyOn.length === 0 || Buffer.byteLength(notifyOn, "utf8") > MAX_NOTIFY_PATTERN_BYTES)) {
+			throw new Error("python: notifyOn must contain 1 to 256 UTF-8 bytes");
+		}
 		await this.cleanupExpired();
 		const interpreter = await this.interpreter();
 		signal?.throwIfAborted();
-		const id = `py-${randomUUID().slice(0, 8)}`;
-		const directory = join(this.jobDir, id);
+		await mkdir(this.jobDir, { recursive: true });
+		let id = "";
+		let directory = "";
+		for (let attempt = 0; attempt < 5; attempt++) {
+			id = `py-${randomUUID().slice(0, 8)}`;
+			directory = join(this.jobDir, id);
+			try {
+				await mkdir(directory);
+				break;
+			} catch (error) {
+				if ((error as NodeJS.ErrnoException).code !== "EEXIST" || attempt === 4) throw error;
+			}
+		}
+		const instanceId = randomUUID().replace(/-/g, "");
 		const codePath = join(directory, "main.py");
 		const logPath = join(directory, "output.log");
 		const metaPath = join(directory, "meta.json");
 		const configPath = join(directory, "config.json");
-		await mkdir(directory, { recursive: true });
 		const now = new Date().toISOString();
 		const initial: JobMetadata = {
-			version: 1,
+			version: 2,
 			id,
+			instanceId,
+			sessionId: this.#sessionId,
 			supervisorPid: 0,
 			cwd,
+			codeSummary: summarizeCode(code),
+			...(notifyOn ? { notifyOn } : {}),
 			createdAt: now,
 			updatedAt: now,
 			status: "starting",
@@ -293,8 +468,11 @@ export class PythonRuntime {
 				writeJsonAtomic(metaPath, initial),
 			]);
 			await writeJsonAtomic(configPath, {
+				id,
+				instanceId,
 				executable: interpreter.executable,
 				prefixArgs: interpreter.prefixArgs,
+				unbuffered: this.unbuffered,
 				cwd,
 				codePath,
 				logPath,
@@ -303,7 +481,7 @@ export class PythonRuntime {
 			signal?.throwIfAborted();
 			const supervisor = spawn(process.execPath, [this.launcherPath, configPath], {
 				cwd,
-				env: runtimeEnvironment(),
+				env: runtimeEnvironment(this),
 				detached: true,
 				stdio: ["ignore", "ignore", "ignore", "ipc"],
 				windowsHide: true,
@@ -339,8 +517,10 @@ export class PythonRuntime {
 				supervisor.on("message", onMessage);
 				if (signal?.aborted) onAbort();
 			});
+			const metadata = await this.readMetadata(id);
+			signal?.throwIfAborted();
 			supervisor.unref();
-			return await this.readMetadata(id);
+			return metadata;
 		} catch (error) {
 			let metadata: JobMetadata | undefined;
 			try {
@@ -348,7 +528,11 @@ export class PythonRuntime {
 			} catch {
 				// Startup may have failed before metadata was fully created.
 			}
-			await killProcessTree(metadata?.supervisorPid || supervisorPid);
+			const ownedMetadata = metadata?.id === id && metadata.instanceId === instanceId ? metadata : undefined;
+			await killProcessTree(supervisorPid || ownedMetadata?.supervisorPid || 0);
+			if (process.platform === "win32" && ownedMetadata?.pid && isAlive(ownedMetadata.pid)) {
+				await killProcessTree(ownedMetadata.pid);
+			}
 			await rm(directory, { recursive: true, force: true });
 			throw error;
 		}
@@ -360,13 +544,15 @@ export class PythonRuntime {
 		const deadline = Date.now() + waitSeconds * 1000;
 		let metadata = await this.refreshMetadata(id);
 		let unread = await this.unreadBytes(id);
-		while (unread === 0 && metadata.status === "running" && Date.now() < deadline) {
+		while (unread === 0 && !isTerminal(metadata.status) && Date.now() < deadline) {
 			await new Promise((resolve) => setTimeout(resolve, Math.min(100, deadline - Date.now())));
 			signal?.throwIfAborted();
 			metadata = await this.refreshMetadata(id);
 			unread = await this.unreadBytes(id);
 		}
+		const terminalBeforeRead = isTerminal(metadata.status);
 		const { output, omittedBytes } = await this.consumeOutput(id);
+		if (terminalBeforeRead) await this.markFinalOutputPresented(metadata);
 		return { metadata, output, omittedBytes };
 	}
 
@@ -380,17 +566,52 @@ export class PythonRuntime {
 			}
 			metadata = await this.readMetadata(id);
 			if (metadata.status === "running" || metadata.status === "starting") {
-				metadata = {
+				const stopped: JobMetadata = {
 					...metadata,
 					status: "stopped",
 					exitCode: null,
 					updatedAt: new Date().toISOString(),
 				};
-				await writeJsonAtomic(this.metaPath(id), metadata);
+				const current = await this.readMetadata(id);
+				if (current.instanceId === metadata.instanceId && !isTerminal(current.status)) {
+					await writeJsonAtomic(this.metaPath(id), stopped);
+					metadata = stopped;
+				} else {
+					metadata = current;
+				}
 			}
 		}
 		const { output, omittedBytes } = await this.consumeOutput(id);
+		if (isTerminal(metadata.status)) await this.markFinalOutputPresented(metadata);
 		return { metadata, output, omittedBytes };
+	}
+
+	async listJobs(sessionId?: string): Promise<JobMetadata[]> {
+		await mkdir(this.jobDir, { recursive: true });
+		const entries = await readdir(this.jobDir, { withFileTypes: true });
+		const jobs = await Promise.all(
+			entries
+				.filter((entry) => entry.isDirectory() && JOB_ID_PATTERN.test(entry.name))
+				.map(async (entry) => {
+					try {
+						return await this.refreshMetadata(entry.name);
+					} catch {
+						return undefined;
+					}
+				}),
+		);
+		return jobs.filter(
+			(metadata): metadata is JobMetadata => metadata !== undefined && (sessionId === undefined || metadata.sessionId === sessionId),
+		);
+	}
+
+	async getJobMetadata(id: string): Promise<JobMetadata> {
+		return this.refreshMetadata(id);
+	}
+
+	jobDirectoryPath(id: string): string {
+		if (!JOB_ID_PATTERN.test(id)) throw new Error(`python: invalid jobId "${id}"`);
+		return join(this.jobDir, id);
 	}
 
 	async cleanupExpired(): Promise<void> {
@@ -417,7 +638,7 @@ export class PythonRuntime {
 	}
 
 	private directory(id: string): string {
-		return join(this.jobDir, id);
+		return this.jobDirectoryPath(id);
 	}
 
 	private metaPath(id: string): string {
@@ -432,9 +653,7 @@ export class PythonRuntime {
 	private async readMetadata(id: string): Promise<JobMetadata> {
 		this.assertJobId(id);
 		try {
-			const value = JSON.parse(await readFile(this.metaPath(id), "utf8")) as JobMetadata;
-			if (value.version !== 1 || value.id !== id) throw new Error("invalid metadata");
-			return value;
+			return parseJobMetadata(JSON.parse(await readFile(this.metaPath(id), "utf8")), id);
 		} catch (error) {
 			throw new Error(`python: could not read background job "${id}": ${error instanceof Error ? error.message : String(error)}`);
 		}
@@ -442,21 +661,60 @@ export class PythonRuntime {
 
 	private async refreshMetadata(id: string): Promise<JobMetadata> {
 		let metadata = await this.readMetadata(id);
-		if ((metadata.status === "running" || metadata.status === "starting") && !isAlive(metadata.supervisorPid)) {
+		if (
+			metadata.status === "starting" &&
+			metadata.supervisorPid === 0 &&
+			Date.now() - Date.parse(metadata.updatedAt) > 10_000
+		) {
+			const failed: JobMetadata = {
+				...metadata,
+				status: "failed",
+				exitCode: null,
+				error: "Background supervisor did not finish starting",
+				updatedAt: new Date().toISOString(),
+			};
+			const current = await this.readMetadata(id);
+			if (current.instanceId === metadata.instanceId && current.status === "starting" && current.supervisorPid === 0) {
+				await writeJsonAtomic(this.metaPath(id), failed);
+				metadata = failed;
+			} else {
+				metadata = current;
+			}
+		}
+		if (!isTerminal(metadata.status) && metadata.supervisorPid > 0 && !isAlive(metadata.supervisorPid)) {
 			await new Promise((resolve) => setTimeout(resolve, 50));
 			metadata = await this.readMetadata(id);
-			if ((metadata.status === "running" || metadata.status === "starting") && !isAlive(metadata.supervisorPid)) {
-				metadata = {
+			if (!isTerminal(metadata.status) && metadata.supervisorPid > 0 && !isAlive(metadata.supervisorPid)) {
+				const failed: JobMetadata = {
 					...metadata,
 					status: "failed",
 					exitCode: null,
 					error: "Background supervisor exited without recording a final status",
 					updatedAt: new Date().toISOString(),
 				};
-				await writeJsonAtomic(this.metaPath(id), metadata);
+				const current = await this.readMetadata(id);
+				if (current.instanceId === metadata.instanceId && !isTerminal(current.status)) {
+					await writeJsonAtomic(this.metaPath(id), failed);
+					metadata = failed;
+				} else {
+					metadata = current;
+				}
 			}
 		}
 		return metadata;
+	}
+
+	private async markFinalOutputPresented(metadata: JobMetadata): Promise<void> {
+		if (!metadata.instanceId) return;
+		const current = await this.readMetadata(metadata.id);
+		if (current.instanceId !== metadata.instanceId || !isTerminal(current.status)) return;
+		const path = join(this.directory(metadata.id), `${metadata.instanceId}.exit.presented`);
+		try {
+			const handle = await open(path, "wx");
+			await handle.close();
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+		}
 	}
 
 	private async unreadBytes(id: string): Promise<number> {
