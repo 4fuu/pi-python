@@ -35,32 +35,35 @@ async function execute(tool: Record<string, any>, params: Record<string, unknown
 }
 
 async function temporaryRuntime() {
-	const jobDir = await mkdtemp(join(tmpdir(), "pi-python-test-"));
-	const runtime = new PythonRuntime({ jobDir });
-	return { runtime, jobDir };
+	const taskDir = await mkdtemp(join(tmpdir(), "pi-python-test-"));
+	const runtime = new PythonRuntime({ taskDir });
+	return { runtime, taskDir };
 }
 
 describe("python extension", () => {
 	it("registers concise prompt metadata and the intended flat schema", () => {
 		const { tool, renderers } = createHarness();
 		assert.equal(tool.name, "python");
-		assert.equal(tool.promptSnippet, "Execute Python scripts");
+		assert.equal(tool.promptSnippet, "Start, query, wait for, receive notifications from, or stop persistent Python tasks");
 		assert.deepEqual(tool.promptGuidelines, [
-			"Use python for complex tasks and computation, both foreground and background.",
+			"Start with code; query or wait with taskId; notifyOn reports literal readiness; only stop=true terminates a task.",
 		]);
-		assert.deepEqual(Object.keys(tool.parameters.properties), ["code", "background", "notifyOn", "timeout", "jobId", "wait", "stop"]);
+		assert.deepEqual(Object.keys(tool.parameters.properties), ["code", "notifyOn", "taskId", "wait", "stop"]);
 		assert.equal(tool.executionMode, "sequential");
-		assert.match(tool.description, /Exactly one of code or jobId is required/);
-		assert.equal(renderers.has("pi-python-job-notification"), true);
+		assert.match(tool.description, /Exactly one of code or taskId is required/);
+		assert.equal(renderers.has("pi-python-task-notification"), true);
 	});
 
-	it("runs foreground Python and reports non-zero exits as errors", async () => {
+	it("starts every call persistently and supports startup wait", async () => {
 		const { tool } = createHarness();
-		const result = await execute(tool, { code: "print('hello from python')" });
+		const result = await execute(tool, { code: "print('hello from python')", wait: 2 });
 		assert.equal(result.details.status, "completed");
 		assert.equal(result.details.exitCode, 0);
-		assert.equal(result.content[0].text, "hello from python");
-		await assert.rejects(execute(tool, { code: "raise RuntimeError('boom')" }), /RuntimeError: boom[\s\S]*exited with code 1/);
+		assert.match(result.details.taskId, /^py_[0-9a-f]{8}$/);
+		assert.match(result.content[0].text, /hello from python/);
+		const failed = await execute(tool, { code: "raise RuntimeError('boom')", wait: 2 });
+		assert.equal(failed.details.status, "failed");
+		assert.match(failed.content[0].text, /RuntimeError: boom/);
 	});
 
 	it("starts and closes session-scoped notification resources", async () => {
@@ -83,102 +86,83 @@ describe("python extension", () => {
 		assert.equal(widgets.at(-1), undefined);
 	});
 
-	it("terminates foreground execution on timeout", async () => {
-		const { runtime, jobDir } = await temporaryRuntime();
-		try {
-			const startedAt = Date.now();
-			await assert.rejects(
-				runtime.runForeground({
-					code: "import time\ntime.sleep(60)",
-					cwd: process.cwd(),
-					timeout: 0.1,
-					onData() {},
-				}),
-				/timed out after 0.1 seconds/,
-			);
-			assert.ok(Date.now() - startedAt < 3000);
-		} finally {
-			await rm(jobDir, { recursive: true, force: true });
-		}
-	});
-
 	it("rejects ambiguous parameter combinations", async () => {
 		const { tool } = createHarness();
-		await assert.rejects(execute(tool, {}), /exactly one of code or jobId/);
-		await assert.rejects(execute(tool, { code: "print(1)", jobId: "py-12345678" }), /exactly one/);
-		await assert.rejects(execute(tool, { code: "print(1)", background: true, timeout: 1 }), /foreground/);
-		await assert.rejects(execute(tool, { code: "print(1)", notifyOn: "ready" }), /background=true/);
-		await assert.rejects(execute(tool, { code: "print(1)", background: true, notifyOn: "界".repeat(86) }), /256 UTF-8 bytes/);
-		await assert.rejects(execute(tool, { jobId: "py-12345678", wait: 1, stop: true }), /wait is not accepted/);
+		await assert.rejects(execute(tool, {}), /exactly one of code or taskId/);
+		await assert.rejects(execute(tool, { code: "print(1)", taskId: "py_12345678" }), /exactly one/);
+		await assert.rejects(execute(tool, { code: "print(1)", notifyOn: "界".repeat(86) }), /256 UTF-8 bytes/);
+		await assert.rejects(execute(tool, { taskId: "py_12345678", notifyOn: "ready" }), /only with code/);
+		await assert.rejects(execute(tool, { taskId: "py_12345678", wait: 1, stop: true }), /wait is not accepted/);
 	});
 
-	it("runs detached jobs and consumes their output incrementally", async () => {
-		const { runtime, jobDir } = await temporaryRuntime();
+	it("runs detached tasks and returns idempotent output snapshots", async () => {
+		const { runtime, taskDir } = await temporaryRuntime();
 		try {
-			const job = await runtime.startBackground(
+			const task = await runtime.startTask(
 				"import time\nprint('first', flush=True)\ntime.sleep(0.5)\nprint('second', flush=True)",
 				process.cwd(),
 			);
-			assert.equal(job.status, "running");
-			assert.ok(job.pid);
+			assert.equal(task.status, "running");
+			assert.ok(task.pid);
 
-			const first = await runtime.readJob(job.id, 0.3);
+			const first = await runtime.readTask(task.id, 0.3);
 			assert.match(first.output, /first/);
-			const second = await runtime.readJob(job.id, 2);
+			const second = await runtime.readTask(task.id, 2);
 			assert.match(second.output, /second/);
-			assert.doesNotMatch(second.output, /first/);
+			assert.match(second.output, /first/);
+			assert.equal((await runtime.readTask(task.id)).output, second.output);
 			// The supervisor records the terminal status asynchronously after the
 			// child exits, so it can lag the final output chunk; poll for it.
 			let final = second;
 			const deadline = Date.now() + 5000;
 			while (final.metadata.status === "running" && Date.now() < deadline) {
 				await new Promise((resolve) => setTimeout(resolve, 50));
-				final = await runtime.readJob(job.id);
+				final = await runtime.readTask(task.id);
 			}
 			assert.equal(final.metadata.status, "completed");
 			assert.equal(final.metadata.exitCode, 0);
 		} finally {
-			await rm(jobDir, { recursive: true, force: true });
+			await rm(taskDir, { recursive: true, force: true });
 		}
 	});
 
-	it("recovers a completed job from a fresh runtime", async () => {
-		const { runtime, jobDir } = await temporaryRuntime();
+	it("recovers a completed task from a fresh runtime", async () => {
+		const { runtime, taskDir } = await temporaryRuntime();
 		try {
-			const job = await runtime.startBackground("print('persisted', flush=True)", process.cwd());
-			const restored = new PythonRuntime({ jobDir });
-			// A fresh runtime instance recovers the job from disk. The supervisor
+			const task = await runtime.startTask("print('persisted', flush=True)", process.cwd());
+			const restored = new PythonRuntime({ taskDir });
+			// A fresh runtime instance recovers the task from disk. The supervisor
 			// records the terminal status asynchronously after the output appears,
 			// so poll (accumulating consumed output) until the status settles.
 			const deadline = Date.now() + 5000;
-			let result = await restored.readJob(job.id, 1);
+			let result = await restored.readTask(task.id, 1);
 			let output = result.output;
 			while (result.metadata.status === "running" && Date.now() < deadline) {
-				result = await restored.readJob(job.id, 1);
+				result = await restored.readTask(task.id, 1);
 				output += result.output;
 			}
 			assert.equal(result.metadata.status, "completed");
 			assert.match(output, /persisted/);
 		} finally {
-			await rm(jobDir, { recursive: true, force: true });
+			await rm(taskDir, { recursive: true, force: true });
 		}
 	});
 
-	it("stops the whole detached job and preserves final status", async () => {
-		const { runtime, jobDir } = await temporaryRuntime();
+	it("stops the whole detached task and preserves final status", async () => {
+		const { runtime, taskDir } = await temporaryRuntime();
 		try {
-			const job = await runtime.startBackground(
+			const task = await runtime.startTask(
 				"import time\nprint('started', flush=True)\ntime.sleep(60)",
 				process.cwd(),
 			);
-			const started = await runtime.readJob(job.id, 1);
+			const started = await runtime.readTask(task.id, 1);
 			assert.match(started.output, /started/);
-			const stopped = await runtime.stopJob(job.id);
-			assert.equal(stopped.metadata.status, "stopped");
-			const reread = await runtime.readJob(job.id);
-			assert.equal(reread.metadata.status, "stopped");
+			const cancelled = await runtime.stopTask(task.id);
+			assert.equal(cancelled.metadata.status, "cancelled");
+			const reread = await runtime.readTask(task.id);
+			assert.equal(reread.metadata.status, "cancelled");
 		} finally {
-			await rm(jobDir, { recursive: true, force: true });
+			await rm(taskDir, { recursive: true, force: true });
 		}
 	});
 });

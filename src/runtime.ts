@@ -1,9 +1,9 @@
 import { randomUUID } from "node:crypto";
-import { spawn, type ChildProcess } from "node:child_process";
+import { spawn } from "node:child_process";
 import { existsSync } from "node:fs";
 import {
+	chmod,
 	mkdir,
-	mkdtemp,
 	open,
 	readFile,
 	readdir,
@@ -18,22 +18,20 @@ import { fileURLToPath } from "node:url";
 
 const SOURCE_DIR = dirname(fileURLToPath(import.meta.url));
 const DEFAULT_LAUNCHER_PATH = join(SOURCE_DIR, "launcher.mjs");
-const DEFAULT_JOB_DIR = join(tmpdir(), "pi-python-jobs");
-const JOB_RETENTION_MS = 24 * 60 * 60 * 1000;
+const DEFAULT_TASK_DIR = join(tmpdir(), "pi-python-tasks");
+const TASK_RETENTION_MS = 24 * 60 * 60 * 1000;
 const MAX_OUTPUT_BYTES = 50 * 1024;
-const MAX_TIMEOUT_MS = 2_147_483_647;
-const EXIT_STDIO_GRACE_MS = 100;
 const MAX_NOTIFY_PATTERN_BYTES = 256;
-const JOB_ID_PATTERN = /^py-[0-9a-f]{8}$/;
-const JOB_STATUSES = new Set<JobStatus>(["starting", "running", "completed", "failed", "stopped"]);
+const TASK_ID_PATTERN = /^py_[0-9a-f]{8}$/;
+const TASK_STATUSES = new Set<TaskStatus>(["starting", "running", "completed", "failed", "cancelled"]);
 
-export type JobStatus = "starting" | "running" | "completed" | "failed" | "stopped";
+export type TaskStatus = "starting" | "running" | "completed" | "failed" | "cancelled";
 
-export interface JobMetadata {
-	version: 1 | 2;
+export interface TaskMetadata {
+	version: 2;
 	id: string;
-	instanceId?: string;
-	sessionId?: string;
+	instanceId: string;
+	sessionId: string;
 	supervisorPid: number;
 	pid?: number;
 	cwd: string;
@@ -41,15 +39,16 @@ export interface JobMetadata {
 	notifyOn?: string;
 	createdAt: string;
 	updatedAt: string;
-	status: JobStatus;
+	status: TaskStatus;
 	exitCode?: number | null;
 	error?: string;
 }
 
-export interface JobResult {
-	metadata: JobMetadata;
+export interface TaskResult {
+	metadata: TaskMetadata;
 	output: string;
 	omittedBytes: number;
+	ready?: boolean;
 }
 
 interface Interpreter {
@@ -59,20 +58,12 @@ interface Interpreter {
 }
 
 interface RuntimeOptions {
-	jobDir?: string;
+	taskDir?: string;
 	launcherPath?: string;
 	interpreter?: { executable: string; prefixArgs?: string[] };
 	utf8?: boolean;
 	unbuffered?: boolean;
 	sessionId?: string;
-}
-
-interface ForegroundOptions {
-	code: string;
-	cwd: string;
-	timeout?: number;
-	signal?: AbortSignal;
-	onData: (data: Buffer) => void;
 }
 
 function findEnvKey(env: NodeJS.ProcessEnv, name: string): string | undefined {
@@ -99,76 +90,6 @@ export function runtimeEnvironment(
 		if (existing === undefined || env[existing] === undefined) env[name] = value;
 	}
 	return env;
-}
-
-/** Wait for process exit without hanging on pipe handles inherited by descendants. */
-function waitForExit(child: ChildProcess): Promise<number | null> {
-	return new Promise((resolve, reject) => {
-		let settled = false;
-		let exited = false;
-		let exitCode: number | null = null;
-		let postExitTimer: NodeJS.Timeout | undefined;
-		let stdoutEnded = child.stdout === null;
-		let stderrEnded = child.stderr === null;
-
-		const cleanup = () => {
-			if (postExitTimer) clearTimeout(postExitTimer);
-			child.removeListener("error", onError);
-			child.removeListener("exit", onExit);
-			child.removeListener("close", onClose);
-			child.stdout?.removeListener("end", onStdoutEnd);
-			child.stderr?.removeListener("end", onStderrEnd);
-			child.stdout?.removeListener("data", onData);
-			child.stderr?.removeListener("data", onData);
-		};
-		const finish = (code: number | null) => {
-			if (settled) return;
-			settled = true;
-			cleanup();
-			child.stdout?.destroy();
-			child.stderr?.destroy();
-			resolve(code);
-		};
-		const maybeFinish = () => {
-			if (exited && stdoutEnded && stderrEnded) finish(exitCode);
-		};
-		const armIdleTimer = () => {
-			if (postExitTimer) clearTimeout(postExitTimer);
-			postExitTimer = setTimeout(() => finish(exitCode), EXIT_STDIO_GRACE_MS);
-		};
-		const onData = () => {
-			if (exited && !settled) armIdleTimer();
-		};
-		const onStdoutEnd = () => {
-			stdoutEnded = true;
-			maybeFinish();
-		};
-		const onStderrEnd = () => {
-			stderrEnded = true;
-			maybeFinish();
-		};
-		const onError = (error: Error) => {
-			if (settled) return;
-			settled = true;
-			cleanup();
-			reject(error);
-		};
-		const onExit = (code: number | null) => {
-			exited = true;
-			exitCode = code;
-			maybeFinish();
-			if (!settled) armIdleTimer();
-		};
-		const onClose = (code: number | null) => finish(code);
-
-		child.stdout?.once("end", onStdoutEnd);
-		child.stderr?.once("end", onStderrEnd);
-		child.stdout?.on("data", onData);
-		child.stderr?.on("data", onData);
-		child.once("error", onError);
-		child.once("exit", onExit);
-		child.once("close", onClose);
-	});
 }
 
 async function probe(executable: string, prefixArgs: string[]): Promise<Interpreter | undefined> {
@@ -247,8 +168,25 @@ function isProcessGroupAlive(pid: number): boolean {
 
 async function writeJsonAtomic(path: string, value: unknown): Promise<void> {
 	const temporary = `${path}.${process.pid}.${randomUUID()}.tmp`;
-	await writeFile(temporary, `${JSON.stringify(value, null, 2)}\n`, "utf8");
+	await writeFile(temporary, `${JSON.stringify(value, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
 	await rename(temporary, path);
+}
+
+function delay(ms: number, signal?: AbortSignal): Promise<void> {
+	if (ms <= 0) return Promise.resolve();
+	signal?.throwIfAborted();
+	return new Promise((resolve, reject) => {
+		const finish = (error?: unknown) => {
+			clearTimeout(timer);
+			signal?.removeEventListener("abort", onAbort);
+			if (error) reject(error);
+			else resolve();
+		};
+		const onAbort = () => finish(signal?.reason ?? new DOMException("This operation was aborted", "AbortError"));
+		const timer = setTimeout(finish, ms);
+		signal?.addEventListener("abort", onAbort, { once: true });
+		if (signal?.aborted) onAbort();
+	});
 }
 
 async function killProcessTree(pid: number): Promise<void> {
@@ -286,7 +224,7 @@ async function killProcessTree(pid: number): Promise<void> {
 	if (isProcessGroupAlive(pid)) throw new Error(`python: process tree ${pid} did not terminate`);
 }
 
-function isTerminal(status: JobStatus): boolean {
+function isTerminal(status: TaskStatus): boolean {
 	return status !== "starting" && status !== "running";
 }
 
@@ -299,19 +237,19 @@ function summarizeCode(code: string): string {
 		.slice(0, 2000);
 }
 
-function parseJobMetadata(value: unknown, id: string): JobMetadata {
+function parseTaskMetadata(value: unknown, id: string): TaskMetadata {
 	if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("invalid metadata");
 	const input = value as Record<string, unknown>;
-	if ((input.version !== 1 && input.version !== 2) || input.id !== id) throw new Error("invalid metadata identity");
+	if (input.version !== 2 || input.id !== id) throw new Error("invalid metadata identity");
 	if (!Number.isInteger(input.supervisorPid) || (input.supervisorPid as number) < 0) throw new Error("invalid supervisor PID");
 	if (input.pid !== undefined && (!Number.isInteger(input.pid) || (input.pid as number) <= 0)) throw new Error("invalid process PID");
 	if (typeof input.cwd !== "string") throw new Error("invalid working directory");
 	if (typeof input.createdAt !== "string" || !Number.isFinite(Date.parse(input.createdAt))) throw new Error("invalid creation time");
 	if (typeof input.updatedAt !== "string" || !Number.isFinite(Date.parse(input.updatedAt))) throw new Error("invalid update time");
-	if (typeof input.status !== "string" || !JOB_STATUSES.has(input.status as JobStatus)) throw new Error("invalid status");
+	if (typeof input.status !== "string" || !TASK_STATUSES.has(input.status as TaskStatus)) throw new Error("invalid status");
 	if (input.exitCode !== undefined && input.exitCode !== null && !Number.isInteger(input.exitCode)) throw new Error("invalid exit code");
 	if (input.error !== undefined && typeof input.error !== "string") throw new Error("invalid error");
-	if (input.version === 2) {
+	{
 		if (typeof input.instanceId !== "string" || !/^[0-9a-f]{32}$/i.test(input.instanceId)) throw new Error("invalid instance ID");
 		if (typeof input.sessionId !== "string") throw new Error("invalid session ID");
 		if (input.codeSummary !== undefined && (typeof input.codeSummary !== "string" || input.codeSummary.length > 2000)) {
@@ -326,11 +264,11 @@ function parseJobMetadata(value: unknown, id: string): JobMetadata {
 			throw new Error("invalid readiness pattern");
 		}
 	}
-	return input as unknown as JobMetadata;
+	return input as unknown as TaskMetadata;
 }
 
 export class PythonRuntime {
-	readonly jobDir: string;
+	readonly taskDir: string;
 	readonly launcherPath: string;
 	readonly configuredInterpreter?: { executable: string; prefixArgs: string[] };
 	readonly utf8: boolean;
@@ -339,7 +277,7 @@ export class PythonRuntime {
 	#interpreter?: Promise<Interpreter>;
 
 	constructor(options: RuntimeOptions = {}) {
-		this.jobDir = options.jobDir ?? DEFAULT_JOB_DIR;
+		this.taskDir = options.taskDir ?? DEFAULT_TASK_DIR;
 		this.launcherPath = options.launcherPath ?? DEFAULT_LAUNCHER_PATH;
 		this.utf8 = options.utf8 ?? true;
 		this.unbuffered = options.unbuffered ?? true;
@@ -365,76 +303,21 @@ export class PythonRuntime {
 		return this.#interpreter;
 	}
 
-	async runForeground(options: ForegroundOptions): Promise<number | null> {
-		options.signal?.throwIfAborted();
-		const interpreter = await this.interpreter();
-		options.signal?.throwIfAborted();
-		const directory = await mkdtemp(join(tmpdir(), "pi-python-run-"));
-		try {
-			const codePath = join(directory, "main.py");
-			await writeFile(codePath, options.code, "utf8");
-			options.signal?.throwIfAborted();
-			const pythonArgs = [...interpreter.prefixArgs, ...(this.unbuffered ? ["-u"] : []), codePath];
-			const child = spawn(interpreter.executable, pythonArgs, {
-				cwd: options.cwd,
-				env: runtimeEnvironment(this),
-				stdio: ["ignore", "pipe", "pipe"],
-				windowsHide: true,
-				detached: process.platform !== "win32",
-			});
-			let timedOut = false;
-			let timeoutHandle: NodeJS.Timeout | undefined;
-			let killPromise: Promise<void> | undefined;
-			const stop = () => {
-				killPromise ??= killProcessTree(child.pid ?? 0);
-			};
-			child.stdout?.on("data", options.onData);
-			child.stderr?.on("data", options.onData);
-			options.signal?.addEventListener("abort", stop, { once: true });
-			if (options.signal?.aborted) stop();
-			if (options.timeout !== undefined) {
-				const timeoutMs = Math.min(options.timeout * 1000, MAX_TIMEOUT_MS);
-				timeoutHandle = setTimeout(() => {
-					timedOut = true;
-					stop();
-				}, timeoutMs);
-			}
-
-			try {
-				const exitCode = await waitForExit(child);
-				if (killPromise) await killPromise;
-				options.signal?.throwIfAborted();
-				if (timedOut) throw new Error(`python: timed out after ${options.timeout} seconds`);
-				return exitCode;
-			} finally {
-				if (timeoutHandle) clearTimeout(timeoutHandle);
-				options.signal?.removeEventListener("abort", stop);
-				if (timedOut || options.signal?.aborted) {
-					stop();
-					await killPromise;
-				}
-			}
-		} finally {
-			await rm(directory, { recursive: true, force: true });
-		}
-	}
-
-	async startBackground(code: string, cwd: string, signal?: AbortSignal, notifyOn?: string): Promise<JobMetadata> {
-		signal?.throwIfAborted();
+	async startTask(code: string, cwd: string, notifyOn?: string): Promise<TaskMetadata> {
 		if (notifyOn !== undefined && (notifyOn.length === 0 || Buffer.byteLength(notifyOn, "utf8") > MAX_NOTIFY_PATTERN_BYTES)) {
 			throw new Error("python: notifyOn must contain 1 to 256 UTF-8 bytes");
 		}
 		await this.cleanupExpired();
 		const interpreter = await this.interpreter();
-		signal?.throwIfAborted();
-		await mkdir(this.jobDir, { recursive: true });
+		await mkdir(this.taskDir, { recursive: true, mode: 0o700 });
+		await chmod(this.taskDir, 0o700);
 		let id = "";
 		let directory = "";
 		for (let attempt = 0; attempt < 5; attempt++) {
-			id = `py-${randomUUID().slice(0, 8)}`;
-			directory = join(this.jobDir, id);
+			id = `py_${randomUUID().slice(0, 8)}`;
+			directory = join(this.taskDir, id);
 			try {
-				await mkdir(directory);
+				await mkdir(directory, { mode: 0o700 });
 				break;
 			} catch (error) {
 				if ((error as NodeJS.ErrnoException).code !== "EEXIST" || attempt === 4) throw error;
@@ -446,7 +329,7 @@ export class PythonRuntime {
 		const metaPath = join(directory, "meta.json");
 		const configPath = join(directory, "config.json");
 		const now = new Date().toISOString();
-		const initial: JobMetadata = {
+		const initial: TaskMetadata = {
 			version: 2,
 			id,
 			instanceId,
@@ -462,9 +345,8 @@ export class PythonRuntime {
 		let supervisorPid = 0;
 		try {
 			await Promise.all([
-				writeFile(codePath, code, "utf8"),
-				writeFile(logPath, "", "utf8"),
-				writeFile(join(directory, "cursor"), "0", "utf8"),
+				writeFile(codePath, code, { encoding: "utf8", mode: 0o600 }),
+				writeFile(logPath, "", { encoding: "utf8", mode: 0o600 }),
 				writeJsonAtomic(metaPath, initial),
 			]);
 			await writeJsonAtomic(configPath, {
@@ -477,8 +359,10 @@ export class PythonRuntime {
 				codePath,
 				logPath,
 				metaPath,
+				notifyOn,
+				readyMarkerPath: join(directory, `${instanceId}.ready.detected`),
+				cancelMarkerPath: join(directory, `${instanceId}.cancelled`),
 			});
-			signal?.throwIfAborted();
 			const supervisor = spawn(process.execPath, [this.launcherPath, configPath], {
 				cwd,
 				env: runtimeEnvironment(this),
@@ -494,37 +378,33 @@ export class PythonRuntime {
 					if (settled) return;
 					settled = true;
 					clearTimeout(timer);
-					signal?.removeEventListener("abort", onAbort);
 					supervisor.removeListener("error", onError);
 					supervisor.removeListener("exit", onExit);
 					supervisor.removeListener("message", onMessage);
 					if (error) reject(error);
 					else resolve();
 				};
-				const onAbort = () => finish(new Error("python: cancelled while starting background job"));
 				const onError = (error: Error) => finish(error);
-				const onExit = (code: number | null) => finish(new Error(`python: background launcher exited during startup (${code})`));
+				const onExit = (code: number | null) => finish(new Error(`python: task launcher exited during startup (${code})`));
 				const onMessage = (message: unknown) => {
 					if (typeof message !== "object" || message === null) return;
 					const value = message as { type?: unknown; error?: unknown };
 					if (value.type === "ready") finish();
 					if (value.type === "error") finish(new Error(`python: ${String(value.error)}`));
 				};
-				const timer = setTimeout(() => finish(new Error("python: background launcher did not start within 5 seconds")), 5000);
-				signal?.addEventListener("abort", onAbort, { once: true });
+				const timer = setTimeout(() => finish(new Error("python: task launcher did not start within 5 seconds")), 5000);
 				supervisor.once("error", onError);
 				supervisor.once("exit", onExit);
 				supervisor.on("message", onMessage);
-				if (signal?.aborted) onAbort();
 			});
 			const metadata = await this.readMetadata(id);
-			signal?.throwIfAborted();
+			if (supervisor.connected) supervisor.disconnect();
 			supervisor.unref();
 			return metadata;
 		} catch (error) {
-			let metadata: JobMetadata | undefined;
+			let metadata: TaskMetadata | undefined;
 			try {
-				metadata = JSON.parse(await readFile(metaPath, "utf8")) as JobMetadata;
+				metadata = JSON.parse(await readFile(metaPath, "utf8")) as TaskMetadata;
 			} catch {
 				// Startup may have failed before metadata was fully created.
 			}
@@ -538,97 +418,120 @@ export class PythonRuntime {
 		}
 	}
 
-	async readJob(id: string, waitSeconds = 0, signal?: AbortSignal): Promise<JobResult> {
-		this.assertJobId(id);
-		signal?.throwIfAborted();
-		const deadline = Date.now() + waitSeconds * 1000;
-		let metadata = await this.refreshMetadata(id);
-		let unread = await this.unreadBytes(id);
-		while (unread === 0 && !isTerminal(metadata.status) && Date.now() < deadline) {
-			await new Promise((resolve) => setTimeout(resolve, Math.min(100, deadline - Date.now())));
-			signal?.throwIfAborted();
-			metadata = await this.refreshMetadata(id);
-			unread = await this.unreadBytes(id);
-		}
-		const terminalBeforeRead = isTerminal(metadata.status);
-		const { output, omittedBytes } = await this.consumeOutput(id);
-		if (terminalBeforeRead) await this.markFinalOutputPresented(metadata);
-		return { metadata, output, omittedBytes };
+	async readTask(id: string, waitSeconds = 0, signal?: AbortSignal): Promise<TaskResult> {
+		return this.waitForTask(id, waitSeconds, signal);
 	}
 
-	async stopJob(id: string): Promise<JobResult> {
-		this.assertJobId(id);
-		let metadata = await this.refreshMetadata(id);
+	/** Wait after launch for literal readiness (when configured) or a terminal state. */
+	async waitForTask(id: string, waitSeconds: number, signal?: AbortSignal): Promise<TaskResult> {
+		this.assertTaskId(id);
+		signal?.throwIfAborted();
+		const deadline = Date.now() + waitSeconds * 1000;
+		let metadata = await this.refreshOwned(id);
+		let snapshot = await this.snapshotOutput(id);
+		let ready = existsSync(this.readyMarkerPath(metadata));
+		while (!ready && !isTerminal(metadata.status) && Date.now() < deadline) {
+			await delay(Math.min(50, deadline - Date.now()), signal);
+			signal?.throwIfAborted();
+			metadata = await this.refreshOwned(id);
+			snapshot = await this.snapshotOutput(id);
+			ready = existsSync(this.readyMarkerPath(metadata));
+		}
+		if (isTerminal(metadata.status)) await this.markFinalOutputPresented(metadata);
+		return { metadata, ...snapshot, ...(ready ? { ready: true } : {}) };
+	}
+
+	async stopTask(id: string): Promise<TaskResult> {
+		this.assertTaskId(id);
+		let metadata = await this.refreshOwned(id);
 		if (metadata.status === "running" || metadata.status === "starting") {
+			const cancelMarker = join(this.directory(id), `${metadata.instanceId}.cancelled`);
+			try {
+				const handle = await open(cancelMarker, "wx");
+				await handle.close();
+			} catch (error) {
+				if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+			}
+			const cancelled: TaskMetadata = {
+				...metadata,
+				status: "cancelled",
+				exitCode: null,
+				updatedAt: new Date().toISOString(),
+			};
+			await writeJsonAtomic(this.metaPath(id), cancelled);
+			metadata = cancelled;
 			await killProcessTree(metadata.supervisorPid);
 			if (process.platform === "win32" && metadata.pid && isAlive(metadata.pid)) {
 				await killProcessTree(metadata.pid);
 			}
-			metadata = await this.readMetadata(id);
-			if (metadata.status === "running" || metadata.status === "starting") {
-				const stopped: JobMetadata = {
-					...metadata,
-					status: "stopped",
-					exitCode: null,
-					updatedAt: new Date().toISOString(),
-				};
-				const current = await this.readMetadata(id);
-				if (current.instanceId === metadata.instanceId && !isTerminal(current.status)) {
-					await writeJsonAtomic(this.metaPath(id), stopped);
-					metadata = stopped;
-				} else {
-					metadata = current;
-				}
+			const current = await this.readMetadata(id);
+			if (current.instanceId !== metadata.instanceId || current.sessionId !== this.#sessionId) {
+				throw new Error(`python: task "${id}" changed while stopping`);
 			}
+			// Re-publish the durable cancellation decision after the supervisor is
+			// gone, closing the final metadata rename race at process exit.
+			metadata = {
+				...current,
+				status: "cancelled",
+				exitCode: null,
+				error: undefined,
+				updatedAt: new Date().toISOString(),
+			};
+			await writeJsonAtomic(this.metaPath(id), metadata);
 		}
-		const { output, omittedBytes } = await this.consumeOutput(id);
+		const { output, omittedBytes } = await this.snapshotOutput(id);
 		if (isTerminal(metadata.status)) await this.markFinalOutputPresented(metadata);
 		return { metadata, output, omittedBytes };
 	}
 
-	async listJobs(sessionId?: string): Promise<JobMetadata[]> {
-		await mkdir(this.jobDir, { recursive: true });
-		const entries = await readdir(this.jobDir, { withFileTypes: true });
-		const jobs = await Promise.all(
+	async listTasks(sessionId?: string): Promise<TaskMetadata[]> {
+		await mkdir(this.taskDir, { recursive: true });
+		const entries = await readdir(this.taskDir, { withFileTypes: true });
+		const tasks = await Promise.all(
 			entries
-				.filter((entry) => entry.isDirectory() && JOB_ID_PATTERN.test(entry.name))
+				.filter((entry) => entry.isDirectory() && TASK_ID_PATTERN.test(entry.name))
 				.map(async (entry) => {
 					try {
-						return await this.refreshMetadata(entry.name);
+						return await this.readMetadata(entry.name);
 					} catch {
 						return undefined;
 					}
 				}),
 		);
-		return jobs.filter(
-			(metadata): metadata is JobMetadata => metadata !== undefined && (sessionId === undefined || metadata.sessionId === sessionId),
+		const selected = tasks.filter(
+			(metadata): metadata is TaskMetadata => metadata !== undefined && (sessionId === undefined || metadata.sessionId === sessionId),
 		);
+		const refreshed = await Promise.all(selected.map((metadata) =>
+			metadata.sessionId === this.#sessionId ? this.refreshOwned(metadata.id) : metadata
+		));
+		return refreshed.sort((a, b) => Date.parse(b.createdAt) - Date.parse(a.createdAt));
 	}
 
-	async getJobMetadata(id: string): Promise<JobMetadata> {
-		return this.refreshMetadata(id);
+	async getTaskMetadata(id: string): Promise<TaskMetadata> {
+		return this.refreshOwned(id);
 	}
 
-	jobDirectoryPath(id: string): string {
-		if (!JOB_ID_PATTERN.test(id)) throw new Error(`python: invalid jobId "${id}"`);
-		return join(this.jobDir, id);
+	taskDirectoryPath(id: string): string {
+		if (!TASK_ID_PATTERN.test(id)) throw new Error(`python: invalid taskId "${id}"`);
+		return join(this.taskDir, id);
 	}
 
 	async cleanupExpired(): Promise<void> {
-		await mkdir(this.jobDir, { recursive: true });
-		const entries = await readdir(this.jobDir, { withFileTypes: true });
+		await mkdir(this.taskDir, { recursive: true, mode: 0o700 });
+		await chmod(this.taskDir, 0o700);
+		const entries = await readdir(this.taskDir, { withFileTypes: true });
 		await Promise.all(
 			entries
-				.filter((entry) => entry.isDirectory() && JOB_ID_PATTERN.test(entry.name))
+				.filter((entry) => entry.isDirectory() && TASK_ID_PATTERN.test(entry.name))
 				.map(async (entry) => {
 					try {
 						const metadata = await this.readMetadata(entry.name);
 						if (
 							metadata.status !== "running" &&
 							metadata.status !== "starting" &&
-							Date.now() - Date.parse(metadata.updatedAt) > JOB_RETENTION_MS
+							Date.now() - Date.parse(metadata.updatedAt) > TASK_RETENTION_MS
 						) {
-							await rm(join(this.jobDir, entry.name), { recursive: true, force: true });
+							await rm(join(this.taskDir, entry.name), { recursive: true, force: true });
 						}
 					} catch {
 						// Leave malformed records untouched; they may be under active creation.
@@ -638,39 +541,56 @@ export class PythonRuntime {
 	}
 
 	private directory(id: string): string {
-		return this.jobDirectoryPath(id);
+		return this.taskDirectoryPath(id);
 	}
 
 	private metaPath(id: string): string {
 		return join(this.directory(id), "meta.json");
 	}
 
-	private assertJobId(id: string): void {
-		if (!JOB_ID_PATTERN.test(id)) throw new Error(`python: invalid jobId "${id}"`);
-		if (!existsSync(this.directory(id))) throw new Error(`python: background job "${id}" was not found`);
+	private readyMarkerPath(metadata: TaskMetadata): string {
+		return join(this.directory(metadata.id), `${metadata.instanceId}.ready.detected`);
 	}
 
-	private async readMetadata(id: string): Promise<JobMetadata> {
-		this.assertJobId(id);
-		try {
-			return parseJobMetadata(JSON.parse(await readFile(this.metaPath(id), "utf8")), id);
-		} catch (error) {
-			throw new Error(`python: could not read background job "${id}": ${error instanceof Error ? error.message : String(error)}`);
+	private assertOwned(metadata: TaskMetadata): void {
+		if (metadata.sessionId !== this.#sessionId) {
+			throw new Error(`python: task "${metadata.id}" belongs to a different session`);
 		}
 	}
 
-	private async refreshMetadata(id: string): Promise<JobMetadata> {
+	private assertTaskId(id: string): void {
+		if (!TASK_ID_PATTERN.test(id)) throw new Error(`python: invalid taskId "${id}"`);
+		if (!existsSync(this.directory(id))) throw new Error(`python: persistent task "${id}" was not found`);
+	}
+
+	private async readMetadata(id: string): Promise<TaskMetadata> {
+		this.assertTaskId(id);
+		try {
+			return parseTaskMetadata(JSON.parse(await readFile(this.metaPath(id), "utf8")), id);
+		} catch (error) {
+			throw new Error(`python: could not read persistent task "${id}": ${error instanceof Error ? error.message : String(error)}`);
+		}
+	}
+
+	private async refreshOwned(id: string): Promise<TaskMetadata> {
+		this.assertOwned(await this.readMetadata(id));
+		const metadata = await this.refreshMetadata(id);
+		this.assertOwned(metadata);
+		return metadata;
+	}
+
+	private async refreshMetadata(id: string): Promise<TaskMetadata> {
 		let metadata = await this.readMetadata(id);
 		if (
 			metadata.status === "starting" &&
 			metadata.supervisorPid === 0 &&
 			Date.now() - Date.parse(metadata.updatedAt) > 10_000
 		) {
-			const failed: JobMetadata = {
+			const failed: TaskMetadata = {
 				...metadata,
 				status: "failed",
 				exitCode: null,
-				error: "Background supervisor did not finish starting",
+				error: "Task supervisor did not finish starting",
 				updatedAt: new Date().toISOString(),
 			};
 			const current = await this.readMetadata(id);
@@ -685,11 +605,11 @@ export class PythonRuntime {
 			await new Promise((resolve) => setTimeout(resolve, 50));
 			metadata = await this.readMetadata(id);
 			if (!isTerminal(metadata.status) && metadata.supervisorPid > 0 && !isAlive(metadata.supervisorPid)) {
-				const failed: JobMetadata = {
+				const failed: TaskMetadata = {
 					...metadata,
 					status: "failed",
 					exitCode: null,
-					error: "Background supervisor exited without recording a final status",
+					error: "Task supervisor exited without recording a final status",
 					updatedAt: new Date().toISOString(),
 				};
 				const current = await this.readMetadata(id);
@@ -704,7 +624,7 @@ export class PythonRuntime {
 		return metadata;
 	}
 
-	private async markFinalOutputPresented(metadata: JobMetadata): Promise<void> {
+	private async markFinalOutputPresented(metadata: TaskMetadata): Promise<void> {
 		if (!metadata.instanceId) return;
 		const current = await this.readMetadata(metadata.id);
 		if (current.instanceId !== metadata.instanceId || !isTerminal(current.status)) return;
@@ -717,25 +637,12 @@ export class PythonRuntime {
 		}
 	}
 
-	private async unreadBytes(id: string): Promise<number> {
+	private async snapshotOutput(id: string): Promise<{ output: string; omittedBytes: number }> {
 		const directory = this.directory(id);
-		const [cursorText, logStat] = await Promise.all([
-			readFile(join(directory, "cursor"), "utf8"),
-			stat(join(directory, "output.log")),
-		]);
-		const cursor = Number.parseInt(cursorText, 10) || 0;
-		return Math.max(0, logStat.size - cursor);
-	}
-
-	private async consumeOutput(id: string): Promise<{ output: string; omittedBytes: number }> {
-		const directory = this.directory(id);
-		const cursorPath = join(directory, "cursor");
 		const logPath = join(directory, "output.log");
-		const [cursorText, logStat] = await Promise.all([readFile(cursorPath, "utf8"), stat(logPath)]);
-		const cursor = Math.min(Number.parseInt(cursorText, 10) || 0, logStat.size);
-		const unread = logStat.size - cursor;
-		const omittedBytes = Math.max(0, unread - MAX_OUTPUT_BYTES);
-		const start = cursor + omittedBytes;
+		const logStat = await stat(logPath);
+		const omittedBytes = Math.max(0, logStat.size - MAX_OUTPUT_BYTES);
+		const start = omittedBytes;
 		const length = logStat.size - start;
 		let output = "";
 		if (length > 0) {
@@ -753,9 +660,6 @@ export class PythonRuntime {
 				await handle.close();
 			}
 		}
-		const cursorTemporary = `${cursorPath}.${process.pid}.${randomUUID()}.tmp`;
-		await writeFile(cursorTemporary, String(logStat.size), "utf8");
-		await rename(cursorTemporary, cursorPath);
 		return { output, omittedBytes };
 	}
 }

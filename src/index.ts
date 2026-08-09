@@ -9,61 +9,44 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { Container, Text, truncateToWidth } from "@earendil-works/pi-tui";
 import { loadConfig } from "./config.ts";
-import { JobNotificationManager, registerJobNotificationRenderer } from "./job-notifications.ts";
-import { PythonRuntime, type JobResult } from "./runtime.ts";
+import { TaskNotificationManager, registerTaskNotificationRenderer } from "./task-notifications.ts";
+import { PythonRuntime, type TaskResult } from "./runtime.ts";
 
-const MAX_CAPTURE_BYTES = 50 * 1024;
+const TOOL_DESCRIPTION = `Start or inspect persistent Python 3 tasks in the current working directory.
 
-const TOOL_DESCRIPTION = `Execute Python 3 code in the current working directory, either in the foreground or as a persistent background job.
-
-Pass code for foreground execution. Output streams until Python exits; use timeout when execution must be bounded.
-
-BACKGROUND JOBS: Set background=true for long-running programs. The job persists across tool calls, /reload, and pi restarts, and completion is reported automatically. Use notifyOn only when the next step depends on a literal readiness message. Pass jobId to read incremental output and status, optionally with wait; set stop=true to terminate the active process tree.
-
-Exactly one of code or jobId is required. timeout applies only to foreground code; wait and stop apply only to jobId. Each result is limited to the latest 50KB.`;
+Exactly one of code or taskId is required. Every code call starts a persistent task immediately. wait expires after the requested number of seconds without stopping the task; with notifyOn it waits for literal readiness, otherwise for completion. A taskId call queries an idempotent status and latest-output snapshot; wait long-polls it. stop=true terminates the process tree. Cancelling the tool only ends its wait. Task IDs are usable only in the parent session that launched them.`;
 
 const PythonParams = Type.Object(
 	{
 		code: Type.Optional(
 			Type.String({
 				minLength: 1,
-				description: "Python 3 source code to execute. Omit when querying a background job.",
-			}),
-		),
-		background: Type.Optional(
-			Type.Boolean({
-				description: "Run code as a persistent background job and return a jobId immediately. Defaults to false.",
+				description: "Python 3 source code that starts a persistent task. Omit when querying a task.",
 			}),
 		),
 		notifyOn: Type.Optional(
 			Type.String({
 				minLength: 1,
 				maxLength: 256,
-				description: "With background=true, request a one-time readiness notification when this literal text appears in output.",
+				description: "For a code call, one-time literal readiness text (1..256 UTF-8 bytes).",
 			}),
 		),
-		timeout: Type.Optional(
-			Type.Number({
-				minimum: 0.001,
-				maximum: 86400,
-				description: "Maximum seconds for foreground execution before its process tree is terminated.",
-			}),
-		),
-		jobId: Type.Optional(
+		taskId: Type.Optional(
 			Type.String({
-				description: "Background job ID returned by an earlier call. Omit when executing code.",
+				pattern: "^py_[0-9a-f]{8}$",
+				description: "Persistent task ID returned by an earlier code call in this parent session.",
 			}),
 		),
 		wait: Type.Optional(
 			Type.Number({
 				minimum: 0,
-				maximum: 30,
-				description: "Seconds to wait for new output or job completion when querying jobId. Defaults to 0.",
+				maximum: 300,
+				description: "Seconds to wait for readiness when notifyOn is configured, otherwise for terminal status. Defaults to 0.",
 			}),
 		),
 		stop: Type.Optional(
 			Type.Boolean({
-				description: "With jobId, terminate the background process tree before returning status and unread output.",
+				description: "With taskId, terminate the process tree before returning its snapshot.",
 			}),
 		),
 	},
@@ -72,50 +55,45 @@ const PythonParams = Type.Object(
 
 interface PythonDetails {
 	version: 1;
-	kind: "foreground" | "background";
-	status: "running" | "completed" | "failed" | "stopped";
+	kind: "task";
+	status: "starting" | "running" | "completed" | "failed" | "cancelled";
 	exitCode?: number | null;
-	jobId?: string;
+	taskId?: string;
 	pid?: number;
+	createdAt: string;
+	ready: boolean;
+	omittedBytes: number;
+	error?: string;
 }
 
-function appendCaptured(current: Buffer, chunk: Buffer): { buffer: Buffer; omitted: boolean } {
-	const combined = Buffer.concat([current, chunk]);
-	if (combined.length <= MAX_CAPTURE_BYTES) return { buffer: combined, omitted: false };
-	return { buffer: combined.subarray(combined.length - MAX_CAPTURE_BYTES), omitted: true };
-}
-
-function foregroundText(output: string, omitted: boolean, exitCode?: number | null): string {
-	const parts: string[] = [];
-	if (omitted) parts.push("[Earlier output omitted; showing the latest 50KB]");
-	if (output) parts.push(output.replace(/\s+$/, ""));
-	if (exitCode !== undefined && !output) parts.push(`Python exited with code ${exitCode}.`);
-	return parts.join("\n");
-}
-
-function jobText(result: JobResult): string {
+function taskText(result: TaskResult): string {
 	const { metadata } = result;
 	const lines = [
-		`jobId: ${metadata.id}`,
+		`taskId: ${metadata.id}`,
 		`status: ${metadata.status}`,
+		...(result.ready ? ["ready: true"] : []),
 		...(metadata.pid ? [`pid: ${metadata.pid}`] : []),
 		...(metadata.exitCode !== undefined ? [`exitCode: ${metadata.exitCode ?? "unknown"}`] : []),
 	];
-	if (result.omittedBytes > 0) lines.push(`output: [${result.omittedBytes} earlier unread bytes omitted]`);
+	if (result.omittedBytes > 0) lines.push(`output: [${result.omittedBytes} earlier bytes omitted]`);
 	else lines.push("output:");
-	lines.push(result.output ? result.output.replace(/\s+$/, "") : "(no new output)");
+	lines.push(result.output ? result.output.replace(/\s+$/, "") : "(no output)");
 	if (metadata.error) lines.push(`error: ${metadata.error}`);
 	return lines.join("\n");
 }
 
-function detailsForJob(result: JobResult): PythonDetails {
+function detailsForTask(result: TaskResult): PythonDetails {
 	return {
 		version: 1,
-		kind: "background",
-		status: result.metadata.status === "starting" ? "running" : result.metadata.status,
+		kind: "task",
+		status: result.metadata.status,
 		exitCode: result.metadata.exitCode,
-		jobId: result.metadata.id,
+		taskId: result.metadata.id,
 		pid: result.metadata.pid,
+		createdAt: result.metadata.createdAt,
+		ready: !!result.ready,
+		omittedBytes: result.omittedBytes,
+		error: result.metadata.error,
 	};
 }
 
@@ -211,18 +189,16 @@ function updateCodeHighlightCacheIncremental(cache: CodeHighlightCache | undefin
 
 type PythonToolArgs = {
 	code?: string;
-	background?: boolean;
 	notifyOn?: string;
-	timeout?: number;
-	jobId?: string;
+	taskId?: string;
 	wait?: number;
 	stop?: boolean;
 };
 
 function formatPythonCodeCall(args: PythonToolArgs, expanded: boolean, theme: Theme, cache: CodeHighlightCache | undefined): string {
 	let text = theme.fg("toolTitle", theme.bold("python"));
-	if (args.background) text += theme.fg("muted", args.notifyOn ? ` (background · notify on ${JSON.stringify(args.notifyOn)})` : " (background)");
-	else if (args.timeout !== undefined) text += theme.fg("muted", ` (timeout ${args.timeout}s)`);
+	if (args.notifyOn) text += theme.fg("muted", ` (notify on ${JSON.stringify(args.notifyOn)})`);
+	if (args.wait !== undefined) text += theme.fg("muted", ` (wait ${args.wait}s)`);
 
 	const code = typeof args.code === "string" ? args.code : "";
 	if (!code) return `${text} ${theme.fg("muted", "...")}`;
@@ -237,8 +213,8 @@ function formatPythonCodeCall(args: PythonToolArgs, expanded: boolean, theme: Th
 	return text;
 }
 
-function formatPythonJobCall(args: PythonToolArgs, theme: Theme): string {
-	let text = `${theme.fg("toolTitle", theme.bold("python"))} ${theme.fg("accent", args.jobId ?? "?")}`;
+function formatPythonTaskCall(args: PythonToolArgs, theme: Theme): string {
+	let text = `${theme.fg("toolTitle", theme.bold("python"))} ${theme.fg("accent", args.taskId ?? "?")}`;
 	if (args.stop) text += theme.fg("muted", " (stop)");
 	else if (args.wait) text += theme.fg("muted", ` (wait ${args.wait}s)`);
 	return text;
@@ -261,8 +237,8 @@ function resultText(result: { content: Array<{ type: string; text?: string }> })
 		.join("\n");
 }
 
-/** Split a job result text into display parts, dropping the structured header already echoed in the status line. */
-function extractJobBody(text: string): { note?: string; body: string } {
+/** Split a task result text into display parts, dropping the structured header already echoed in the status line. */
+function extractTaskBody(text: string): { note?: string; body: string } {
 	const lines = text.split("\n");
 	const markerIndex = lines.findIndex((line) => line === "output:" || line.startsWith("output: ["));
 	if (markerIndex === -1) return { body: text };
@@ -271,12 +247,13 @@ function extractJobBody(text: string): { note?: string; body: string } {
 	return { note, body: lines.slice(markerIndex + 1).join("\n") };
 }
 
-function jobStatusHeader(details: PythonDetails, theme: Theme): string {
+function taskStatusHeader(details: PythonDetails, duration: string, expanded: boolean, theme: Theme): string {
 	const statusColor =
-		details.status === "completed" ? "success" : details.status === "failed" ? "error" : details.status === "stopped" ? "muted" : "warning";
-	let text = `${theme.fg("toolTitle", theme.bold("job"))} ${theme.fg("accent", details.jobId ?? "?")} ${theme.fg(statusColor, details.status)}`;
-	if (details.pid) text += theme.fg("dim", ` · pid ${details.pid}`);
-	if (details.exitCode !== undefined) text += theme.fg("dim", ` · exit ${details.exitCode ?? "unknown"}`);
+		details.status === "completed" ? "success" : details.status === "failed" ? "error" : details.status === "cancelled" ? "muted" : "warning";
+	let text = `${theme.fg("toolTitle", theme.bold("python"))} ${theme.fg("accent", details.taskId ?? "?")} ${theme.fg(statusColor, details.status)} ${theme.fg("dim", `· ${duration}`)}`;
+	if (details.ready) text += theme.fg("success", " · ready");
+	if (expanded && details.pid) text += theme.fg("dim", ` · PID ${details.pid}`);
+	if (expanded && details.exitCode !== undefined) text += theme.fg("dim", ` · exit ${details.exitCode ?? "unknown"}`);
 	return text;
 }
 
@@ -294,7 +271,7 @@ class PythonResultComponent extends Container {
 
 function rebuildPythonResultComponent(
 	component: PythonResultComponent,
-	parts: { header?: string; output: string; note?: string; timing?: string },
+	parts: { header?: string; output: string; note?: string; error?: string },
 	options: { expanded: boolean },
 	theme: Theme,
 ): void {
@@ -338,43 +315,34 @@ function rebuildPythonResultComponent(
 	}
 
 	if (parts.note) component.addChild(new Text(`\n${theme.fg("warning", `[${parts.note}]`)}`, 0, 0));
-	if (parts.timing) component.addChild(new Text(`\n${theme.fg("muted", parts.timing)}`, 0, 0));
+	if (parts.error) component.addChild(new Text(`\n${theme.fg("error", parts.error)}`, 0, 0));
 }
 
 function assertValidCombination(params: {
 	code?: string;
-	background?: boolean;
 	notifyOn?: string;
-	timeout?: number;
-	jobId?: string;
+	taskId?: string;
 	wait?: number;
 	stop?: boolean;
 }): void {
-	if ((params.code === undefined) === (params.jobId === undefined)) {
-		throw new Error("python: provide exactly one of code or jobId");
+	if ((params.code === undefined) === (params.taskId === undefined)) {
+		throw new Error("python: provide exactly one of code or taskId");
 	}
 	if (params.code !== undefined) {
-		if (params.wait !== undefined) throw new Error("python: wait is accepted only with jobId");
-		if (params.stop !== undefined) throw new Error("python: stop is accepted only with jobId");
-		if (params.notifyOn !== undefined && !params.background) throw new Error("python: notifyOn requires background=true");
+		if (params.stop !== undefined) throw new Error("python: stop is accepted only with taskId");
 		if (params.notifyOn !== undefined && (params.notifyOn.length === 0 || Buffer.byteLength(params.notifyOn, "utf8") > 256)) {
 			throw new Error("python: notifyOn must contain 1 to 256 UTF-8 bytes");
 		}
-		if (params.background && params.timeout !== undefined) {
-			throw new Error("python: timeout is accepted only for foreground execution");
-		}
 		return;
 	}
-	if (params.background !== undefined) throw new Error("python: background is accepted only with code");
-	if (params.notifyOn !== undefined) throw new Error("python: notifyOn is accepted only with background code");
-	if (params.timeout !== undefined) throw new Error("python: timeout is accepted only with foreground code");
+	if (params.notifyOn !== undefined) throw new Error("python: notifyOn is accepted only with code");
 	if (params.stop && params.wait !== undefined) throw new Error("python: wait is not accepted when stop=true");
 }
 
 export default function pythonExtension(pi: ExtensionAPI): void {
 	let runtime: PythonRuntime | undefined;
 	let setupError: string | undefined;
-	let notifications: JobNotificationManager | undefined;
+	let notifications: TaskNotificationManager | undefined;
 	try {
 		const { config } = loadConfig({ agentDir: getAgentDir() });
 		runtime = new PythonRuntime({
@@ -385,20 +353,20 @@ export default function pythonExtension(pi: ExtensionAPI): void {
 	} catch (error) {
 		setupError = error instanceof Error ? error.message : String(error);
 	}
-	registerJobNotificationRenderer(pi);
+	registerTaskNotificationRenderer(pi);
 
 	pi.registerTool({
 		name: "python",
 		label: "Python",
 		description: TOOL_DESCRIPTION,
-		promptSnippet: "Execute Python scripts",
+		promptSnippet: "Start, query, wait for, receive notifications from, or stop persistent Python tasks",
 		promptGuidelines: [
-			"Use python for complex tasks and computation, both foreground and background.",
+			"Start with code; query or wait with taskId; notifyOn reports literal readiness; only stop=true terminates a task.",
 		],
 		parameters: PythonParams,
 		executionMode: "sequential",
 
-		async execute(_toolCallId, params, signal, onUpdate, ctx) {
+		async execute(_toolCallId, params, signal, _onUpdate, ctx) {
 			signal?.throwIfAborted();
 			assertValidCombination(params);
 			if (!runtime) throw new Error(`python: ${setupError ?? "runtime configuration could not be loaded"}`);
@@ -406,64 +374,23 @@ export default function pythonExtension(pi: ExtensionAPI): void {
 			const releaseNotifications = notifications?.deferDuringToolCall() ?? (() => {});
 			try {
 
-				if (params.jobId !== undefined) {
+				if (params.taskId !== undefined) {
 					const result = params.stop
-						? await activeRuntime.stopJob(params.jobId)
-						: await activeRuntime.readJob(params.jobId, params.wait ?? 0, signal);
+						? await activeRuntime.stopTask(params.taskId)
+						: await activeRuntime.readTask(params.taskId, params.wait ?? 0, signal);
 					return {
-						content: [{ type: "text" as const, text: jobText(result) }],
-						details: detailsForJob(result),
+						content: [{ type: "text" as const, text: taskText(result) }],
+						details: detailsForTask(result),
 					};
 				}
 
-				const code = params.code as string;
-				if (params.background) {
-					const metadata = await activeRuntime.startBackground(code, ctx.cwd, signal, params.notifyOn);
-					const text = [
-						"Python job started.",
-						`jobId: ${metadata.id}`,
-						`pid: ${metadata.pid}`,
-						...(params.notifyOn ? [`notifyOn: ${JSON.stringify(params.notifyOn)}`] : []),
-					].join("\n");
-					return {
-						content: [{ type: "text" as const, text }],
-						details: {
-							version: 1,
-							kind: "background",
-							status: "running",
-							jobId: metadata.id,
-							pid: metadata.pid,
-						} satisfies PythonDetails,
-					};
-				}
-
-				let captured: Buffer = Buffer.alloc(0);
-				let omitted = false;
-				const exitCode = await activeRuntime.runForeground({
-					code,
-					cwd: ctx.cwd,
-					timeout: params.timeout,
-					signal,
-					onData(chunk) {
-						const next = appendCaptured(captured, chunk);
-						captured = next.buffer;
-						omitted ||= next.omitted;
-						onUpdate?.({
-							content: [{ type: "text" as const, text: foregroundText(captured.toString("utf8"), omitted) }],
-							details: { version: 1, kind: "foreground", status: "running" } satisfies PythonDetails,
-						});
-					},
-				});
-				const output = foregroundText(captured.toString("utf8"), omitted, exitCode === 0 ? exitCode : undefined);
-				if (exitCode !== 0) throw new Error(`${output ? `${output}\n\n` : ""}Python exited with code ${exitCode}.`);
+				const metadata = await activeRuntime.startTask(params.code as string, ctx.cwd, params.notifyOn);
+				const result = params.wait !== undefined
+					? await activeRuntime.waitForTask(metadata.id, params.wait, signal)
+					: { metadata, output: "", omittedBytes: 0 };
 				return {
-					content: [{ type: "text" as const, text: output }],
-					details: {
-						version: 1,
-						kind: "foreground",
-						status: "completed",
-						exitCode,
-					} satisfies PythonDetails,
+					content: [{ type: "text" as const, text: taskText(result) }],
+					details: detailsForTask(result),
 				};
 			} finally {
 				releaseNotifications();
@@ -490,7 +417,7 @@ export default function pythonExtension(pi: ExtensionAPI): void {
 			} else {
 				component.highlightCache = undefined;
 				component.setText(
-					typeof args?.jobId === "string" ? formatPythonJobCall(args, theme) : theme.fg("toolTitle", theme.bold("python")),
+					typeof args?.taskId === "string" ? formatPythonTaskCall(args, theme) : theme.fg("toolTitle", theme.bold("python")),
 				);
 			}
 			return component;
@@ -512,25 +439,20 @@ export default function pythonExtension(pi: ExtensionAPI): void {
 			const details = result.details as PythonDetails | undefined;
 			let header: string | undefined;
 			let note: string | undefined;
+			let error: string | undefined;
 			let output = sanitizeOutput(resultText(result));
-			if (details?.kind === "background") {
-				header = jobStatusHeader(details, theme);
-				if (output.startsWith("Python job started.")) {
-					output = "";
-				} else {
-					const extracted = extractJobBody(output);
-					note = extracted.note;
-					output = extracted.body;
-				}
+			if (details?.kind === "task") {
+				const duration = formatDuration(Math.max(0, Date.now() - Date.parse(details.createdAt)));
+				header = taskStatusHeader(details, duration, options.expanded, theme);
+				const extracted = extractTaskBody(output);
+				note = extracted.note;
+				output = extracted.body;
+				error = details.error;
+				if (error && output.endsWith(`\nerror: ${error}`)) output = output.slice(0, -(`\nerror: ${error}`).length);
+				if ((details.status === "starting" || details.status === "running") && output.trim() === "(no output)") output = "";
 			}
-			let timing: string | undefined;
-			if (state.startedAt !== undefined && details?.kind !== "background") {
-				const label = options.isPartial ? "Elapsed" : "Took";
-				timing = `${label} ${formatDuration((state.endedAt ?? Date.now()) - state.startedAt)}`;
-			}
-
 			const component = (context.lastComponent as PythonResultComponent | undefined) ?? new PythonResultComponent();
-			rebuildPythonResultComponent(component, { header, output, note, timing }, options, theme);
+			rebuildPythonResultComponent(component, { header, output, note, error }, options, theme);
 			return component;
 		},
 	});
@@ -556,13 +478,13 @@ export default function pythonExtension(pi: ExtensionAPI): void {
 			ctx.ui.notify(`pi-python: ${error instanceof Error ? error.message : String(error)}`, "error");
 			return;
 		}
-		const manager = new JobNotificationManager(pi, ctx, runtime, ctx.sessionManager.getSessionId());
+		const manager = new TaskNotificationManager(pi, ctx, runtime, ctx.sessionManager.getSessionId());
 		try {
 			await manager.start();
 			notifications = manager;
 		} catch (error) {
 			await manager.close();
-			ctx.ui.notify(`pi-python: job notification startup failed: ${error instanceof Error ? error.message : String(error)}`, "error");
+			ctx.ui.notify(`pi-python: task notification startup failed: ${error instanceof Error ? error.message : String(error)}`, "error");
 		}
 	});
 }
