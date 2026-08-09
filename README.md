@@ -2,22 +2,19 @@
 
 [![Latest release](https://img.shields.io/github/v/release/4fuu/pi-python)](https://github.com/4fuu/pi-python/releases/latest)
 
-Run Python 3 in [pi](https://github.com/earendil-works/pi) as durable, observable tasks with low-noise readiness and completion notifications.
+Persistent Python execution for [pi](https://github.com/earendil-works/pi). Long-running scripts, local analysis, and temporary services keep running while the agent moves on, with results delivered through durable notifications and snapshots.
 
 ## Why pi-python
 
-Python is often the clearest tool for data transformation, structured inspection, calculations, and small automation tasks. `pi-python` gives the model a purpose-built execution surface without mixing Python source into shell quoting.
+Pi can launch Python from a shell, but that does not give the agent a durable execution lifecycle. `pi-python` turns each run into managed work that remains observable after the original tool call has returned.
 
-- **Python-native input** — the model sends Python 3 source directly, with syntax-aware TUI rendering.
-- **One narrow task interface** — source starts durable work; the returned `taskId` is the only handle needed to inspect, wait for, or stop it.
-- **Persistent by default** — every invocation survives later tool calls, `/reload`, pi restarts, wait timeouts, and tool aborts.
-- **Quiet automatic notifications** — completion and optional literal readiness arrive without polling or another model-facing tool.
-- **Repeatable snapshots** — queries return current status and bounded latest output without consuming the log.
-- **Process-tree cleanup** — only an explicit stop terminates the Python task and its descendants.
-- **Session ownership** — a task can be controlled only by the parent session that launched it.
-- **Strict, optional configuration** — executable selection and UTF-8 behavior stay outside the base prompt.
+- **Keep working while Python runs** — execution is detached by default and survives later tool calls, wait timeouts, tool aborts, `/reload`, and pi restarts.
+- **Know when work is ready** — optional literal readiness and automatic terminal notifications remove the need for repeated polling.
+- **Inspect results safely** — every query returns a bounded snapshot of current state and latest output without consuming the log.
+- **Stop the whole workload** — explicit cancellation terminates the Python process and its descendants rather than leaving child processes behind.
+- **Readable in the TUI** — source is syntax-highlighted, output previews are ANSI-safe, and active tasks remain visible with status and duration.
 
-This keeps the schema and guidance compact: pi sees one `python` tool and one consistent task lifecycle rather than separate foreground, background, and job APIs.
+The extension intentionally manages independent Python processes rather than emulating a shared notebook or REPL session.
 
 ## Features
 
