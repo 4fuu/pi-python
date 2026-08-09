@@ -1,6 +1,82 @@
 # pi-python
 
-Run Python 3 in [pi](https://github.com/earendil-works/pi) as durable, observable tasks. Every invocation starts in the background; tasks survive tool calls, `/reload`, and pi restarts.
+[![Latest release](https://img.shields.io/github/v/release/4fuu/pi-python)](https://github.com/4fuu/pi-python/releases/latest)
+
+Run Python 3 in [pi](https://github.com/earendil-works/pi) as durable, observable tasks with low-noise readiness and completion notifications.
+
+## Why pi-python
+
+Python is often the clearest tool for data transformation, structured inspection, calculations, and small automation tasks. `pi-python` gives the model a purpose-built execution surface without mixing Python source into shell quoting.
+
+- **Python-native input** — the model sends Python 3 source directly, with syntax-aware TUI rendering.
+- **One narrow task interface** — source starts durable work; the returned `taskId` is the only handle needed to inspect, wait for, or stop it.
+- **Persistent by default** — every invocation survives later tool calls, `/reload`, pi restarts, wait timeouts, and tool aborts.
+- **Quiet automatic notifications** — completion and optional literal readiness arrive without polling or another model-facing tool.
+- **Repeatable snapshots** — queries return current status and bounded latest output without consuming the log.
+- **Process-tree cleanup** — only an explicit stop terminates the Python task and its descendants.
+- **Session ownership** — a task can be controlled only by the parent session that launched it.
+- **Strict, optional configuration** — executable selection and UTF-8 behavior stay outside the base prompt.
+
+This keeps the schema and guidance compact: pi sees one `python` tool and one consistent task lifecycle rather than separate foreground, background, and job APIs.
+
+## Features
+
+### Persistent Python tasks
+
+Talk to pi normally—the `python` tool is designed for the model rather than as a command you invoke yourself:
+
+> **You:** Compute the first 200 prime numbers and keep working on the report while that runs.
+>
+> **pi:** starts the computation as a persistent Python task, receives `py_…`, and continues editing the report.
+>
+> **Notification:** the Python task completed.
+>
+> **pi:** retrieves the final snapshot and incorporates the result.
+
+Every Python invocation creates a persistent task and returns immediately unless the current turn explicitly needs to wait. Waiting can end at completion or at an optional case-sensitive readiness phrase, including one split across output chunks; a timeout or cancelled wait never stops the program.
+
+The returned task ID lets the model inspect the latest snapshot, wait again, or explicitly terminate the complete process tree. Snapshots are bounded and repeatable rather than consumable. Task IDs belong to the parent session that launched them. Active tasks recover across `/reload` and pi restarts, and terminal records are retained for 24 hours.
+
+### Task notifications and TUI
+
+Readiness, completion, failure, and cancellation are reported automatically. Notification state is durable and deduplicated. If the model has already retrieved complete terminal output, a later notification is reduced to compact status instead of repeating the payload.
+
+Tool rows preserve Python syntax highlighting, ANSI-safe output previews, duration, and expandable details. The dedicated **Python Tasks** widget shows up to three active tasks with status, duration, and source preview.
+
+## Configuration
+
+Configuration is optional. Create `~/.pi/agent/python.json` and run `/reload` after changing it:
+
+```json
+{
+  "executable": "auto",
+  "utf8": true,
+  "unbuffered": true
+}
+```
+
+| Setting | Default | Effect |
+| --- | --- | --- |
+| `executable` | `"auto"` | Tries `python3`, then `python`. Set an absolute path to select a specific Python 3 executable. |
+| `utf8` | `true` | Defaults `PYTHONIOENCODING=utf-8` and `PYTHONUTF8=1` unless already set. |
+| `unbuffered` | `true` | Defaults `PYTHONUNBUFFERED=1` and launches Python with `-u`. |
+
+Environment variables override the JSON file:
+
+| Environment variable | Setting |
+| --- | --- |
+| `PI_PYTHON_CONFIG` | Alternate configuration file path |
+| `PI_PYTHON_EXECUTABLE` | `executable` |
+| `PI_PYTHON_UTF8` | `utf8` |
+| `PI_PYTHON_UNBUFFERED` | `unbuffered` |
+
+Boolean environment values accept `true`/`false`, `1`/`0`, `yes`/`no`, and `on`/`off`. Existing Python environment values win. Configuration is strict: unknown fields, invalid values, or an unavailable configured executable produce a visible error.
+
+## Requirements
+
+- Node.js 22.19 or newer.
+- Python 3, available as `python3` or `python`, or selected with an absolute `executable` path.
+- macOS, Linux, or Windows wherever pi and the selected Python runtime are available.
 
 ## Installation
 
@@ -8,71 +84,24 @@ Run Python 3 in [pi](https://github.com/earendil-works/pi) as durable, observabl
 pi install npm:@4fu/pi-python
 ```
 
-Try without installing with `pi -e npm:@4fu/pi-python`. From source, run `npm install`, add this repository to `~/.pi/agent/settings.json`, and `/reload`.
+Try it for one run without installing:
 
-## Usage
-
-Talk to pi normally—the `python` tool is for the model. A typical interaction looks like this:
-
-> **You:** Compute the first 200 prime numbers and keep working on the report while that runs.
->
-> **pi:** starts `python({"code":"..."})`, receives `py_…`, and continues independent work instead of polling.
->
-> **Notification:** `py_… completed`
->
-> **pi:** uses the result in the report.
-
-When the current turn needs a short computation immediately, the model can wait on the same persistent task:
-
-```json
-{"code":"print(sum(range(100)))","wait":10}
+```bash
+pi -e npm:@4fu/pi-python
 ```
 
-For a service, `notifyOn` is a literal readiness match, including across output chunks. Readiness is reported once and does not complete the task:
+### From source
+
+Run `npm install`, then add the repository path to `~/.pi/agent/settings.json`:
 
 ```json
-{"code":"from http.server import test\ntest(port=8000)","notifyOn":"Serving HTTP on","wait":30}
+{
+  "extensions": ["/path/to/pi-python"]
+}
 ```
 
-Inspect or long-poll an existing task, or explicitly stop its process tree:
+Run `/reload` in pi after changing the extension.
 
-```json
-{ "taskId": "py_1234abcd" }
-{ "taskId": "py_1234abcd", "wait": 10 }
-{ "taskId": "py_1234abcd", "stop": true }
-```
-
-## Parameters and lifecycle
-
-Exactly one of `code` or `taskId` is required.
-
-| Parameter | Calls | Meaning |
-| --- | --- | --- |
-| `code` | start | Non-empty Python 3 source. Always creates a persistent task. |
-| `taskId` | query | Identifier returned by a start call. |
-| `wait` | both | `0..300` seconds. Both start and query wait for readiness when `notifyOn` is present, otherwise terminal state. Timeout only ends the wait. |
-| `notifyOn` | start | Literal of 1..256 UTF-8 bytes. It matches across chunks and notifies at most once. |
-| `stop` | query | The only operation that terminates the task process tree. |
-
-Public states are `starting`, `running`, `completed`, `failed`, and `cancelled`. Task IDs are restricted to the parent session that launched them. Queries are idempotent snapshots: repeated reads return current metadata and the bounded latest 50KB, rather than consuming unread output. Tool cancellation only cancels a wait after task creation. Completion, failure, cancellation, and readiness notifications are persisted and deduplicated; explicit retrieval of a terminal result suppresses duplicate final output while preserving UI state. Active tasks are recovered after reload/restart.
-
-The TUI keeps Python syntax highlighting, ANSI-safe output previews, expansion, and duration. Calls and results consistently use `taskId`; the Python Tasks widget shows up to three active task/status/duration/source-preview rows.
-
-### Migration from 0.3
-
-Version 0.4 is intentionally breaking: remove `background` and `timeout`, replace every `jobId` with `taskId`, and expect every `code` call to persist. Replace incremental/unread-output logic with repeatable snapshot queries. Replace the old `stopped` state with `cancelled`; use `wait` for both start and query behavior.
-
-## Configuration
-
-Optional `~/.pi/agent/python.json`:
-
-```json
-{ "executable": "auto", "utf8": true, "unbuffered": true }
-```
-
-`executable` tries `python3` then `python`, or accepts an absolute Python 3 path. `utf8` defaults `PYTHONIOENCODING=utf-8` and `PYTHONUTF8=1`; `unbuffered` defaults `PYTHONUNBUFFERED=1` and uses `-u`. Existing environment values win. Environment overrides are `PI_PYTHON_CONFIG`, `PI_PYTHON_EXECUTABLE`, `PI_PYTHON_UTF8`, and `PI_PYTHON_UNBUFFERED`.
-
-Requires Node.js 22.19+ and Python 3.
 
 ## Development
 
@@ -82,4 +111,8 @@ npm test
 npm pack --dry-run
 ```
 
-MIT licensed.
+The test suite covers configuration, schema validation, persistent task recovery, session ownership, snapshots, notifications, readiness matching, waits, and process-tree termination.
+
+## License
+
+MIT
