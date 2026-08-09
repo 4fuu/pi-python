@@ -23,16 +23,6 @@ This keeps the schema and guidance compact: pi sees one `python` tool and one co
 
 ### Persistent Python tasks
 
-Talk to pi normally—the `python` tool is designed for the model rather than as a command you invoke yourself:
-
-> **You:** Compute the first 200 prime numbers and keep working on the report while that runs.
->
-> **pi:** starts the computation as a persistent Python task, receives `py_…`, and continues editing the report.
->
-> **Notification:** the Python task completed.
->
-> **pi:** retrieves the final snapshot and incorporates the result.
-
 Every Python invocation creates a persistent task and returns immediately unless the current turn explicitly needs to wait. Waiting can end at completion or at an optional case-sensitive readiness phrase, including one split across output chunks; a timeout or cancelled wait never stops the program.
 
 The returned task ID lets the model inspect the latest snapshot, wait again, or explicitly terminate the complete process tree. Snapshots are bounded and repeatable rather than consumable. Task IDs belong to the parent session that launched them. Active tasks recover across `/reload` and pi restarts, and terminal records are retained for 24 hours.
