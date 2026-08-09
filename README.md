@@ -26,9 +26,9 @@ The returned task ID lets the model inspect the latest snapshot, wait again, or 
 
 ### Task notifications and TUI
 
-Readiness, completion, failure, and cancellation are reported automatically. Notification state is durable and deduplicated. If the model has already retrieved complete terminal output, a later notification is reduced to compact status instead of repeating the payload.
+Readiness, completion, failure, and cancellation are reported automatically. Notification state is durable and deduplicated, and notifications aggregate with other installed `@4fu` background-task plugins. Explicitly retrieving a ready or terminal result cancels its pending notification.
 
-Tool rows preserve Python syntax highlighting, ANSI-safe output previews, duration, and expandable details. The dedicated **Python Tasks** widget shows up to three active tasks with status, duration, and source preview.
+Tool rows use a compact contiguous layout with Python syntax highlighting, ANSI-safe output previews, duration, and expandable details. Active tasks share the background-task widget with other installed `@4fu` task plugins.
 
 ## Configuration
 

@@ -11,7 +11,16 @@ function createHarness() {
 	const handlers = new Map<string, Array<(...args: any[]) => unknown>>();
 	const renderers = new Map<string, (...args: any[]) => unknown>();
 	const messages: Array<{ message: unknown; options: unknown }> = [];
+	const eventHandlers = new Map<string, Array<(event: unknown) => void>>();
 	const pi = {
+		events: {
+			on(name: string, handler: (event: unknown) => void) {
+				eventHandlers.set(name, [...(eventHandlers.get(name) ?? []), handler]);
+			},
+			emit(name: string, event: unknown) {
+				for (const handler of eventHandlers.get(name) ?? []) handler(event);
+			},
+		},
 		registerTool(definition: Record<string, any>) {
 			tool = definition;
 		},
@@ -51,7 +60,29 @@ describe("python extension", () => {
 		assert.deepEqual(Object.keys(tool.parameters.properties), ["code", "notifyOn", "taskId", "wait", "stop"]);
 		assert.equal(tool.executionMode, "sequential");
 		assert.match(tool.description, /Exactly one of code or taskId is required/);
-		assert.equal(renderers.has("pi-python-task-notification"), true);
+		assert.equal(renderers.has("pi-background-task-notification"), true);
+	});
+
+	it("renders call, status, and output without blank spacer rows", () => {
+		const { tool } = createHarness();
+		const theme = { fg: (_tone: string, text: string) => text, bold: (text: string) => text };
+		const call = tool.renderCall(
+			{ code: "print('compact')" }, theme,
+			{ state: {}, argsComplete: true, expanded: false, executionStarted: false },
+		);
+		assert.deepEqual(call.render(100).map((line: string) => line.trimEnd()), ["python", "print('compact')"]);
+		const createdAt = new Date().toISOString();
+		const result = tool.renderResult(
+			{ content: [{ type: "text", text: "taskId: py_12345678\nstatus: completed\noutput:\ncompact" }], details: {
+				version: 1, kind: "task", taskId: "py_12345678", status: "completed", createdAt, ready: false, omittedBytes: 0,
+			} },
+			{ expanded: false, isPartial: false }, theme,
+			{ state: {}, isError: false, invalidate() {} },
+		);
+		const lines = result.render(100).map((line: string) => line.trimEnd());
+		assert.equal(lines.some((line: string) => line === ""), false);
+		assert.match(lines[0], /^python py_12345678 completed/);
+		assert.equal(lines.at(-1), "compact");
 	});
 
 	it("starts every call persistently and supports startup wait", async () => {
@@ -64,6 +95,39 @@ describe("python extension", () => {
 		const failed = await execute(tool, { code: "raise RuntimeError('boom')", wait: 2 });
 		assert.equal(failed.details.status, "failed");
 		assert.match(failed.content[0].text, /RuntimeError: boom/);
+	});
+
+	it("takes a real zero-wait snapshot before suppressing a fast terminal notification", async () => {
+		const originalStartTask = PythonRuntime.prototype.startTask;
+		const originalReadTask = PythonRuntime.prototype.readTask;
+		const originalMarkResultPresented = PythonRuntime.prototype.markResultPresented;
+		const createdAt = new Date().toISOString();
+		let presentedOutput: string | undefined;
+		try {
+			PythonRuntime.prototype.startTask = async () => ({
+				version: 2, id: "py_12345678", instanceId: "a".repeat(32), sessionId: "", supervisorPid: 1,
+				cwd: process.cwd(), createdAt, updatedAt: createdAt, status: "completed", exitCode: 0,
+			});
+			PythonRuntime.prototype.readTask = async (_id, wait, signal) => {
+				assert.equal(wait, 0);
+				assert.equal(signal, undefined);
+				return {
+					metadata: await PythonRuntime.prototype.startTask("", ""),
+					output: "fast output",
+					omittedBytes: 0,
+				};
+			};
+			PythonRuntime.prototype.markResultPresented = async (result) => { presentedOutput = result.output; };
+
+			const { tool } = createHarness();
+			const result = await execute(tool, { code: "print('fast output')" });
+			assert.match(result.content[0].text, /fast output/);
+			assert.equal(presentedOutput, "fast output");
+		} finally {
+			PythonRuntime.prototype.startTask = originalStartTask;
+			PythonRuntime.prototype.readTask = originalReadTask;
+			PythonRuntime.prototype.markResultPresented = originalMarkResultPresented;
+		}
 	});
 
 	it("starts and closes session-scoped notification resources", async () => {

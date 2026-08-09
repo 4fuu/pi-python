@@ -437,7 +437,8 @@ export class PythonRuntime {
 			snapshot = await this.snapshotOutput(id);
 			ready = existsSync(this.readyMarkerPath(metadata));
 		}
-		if (isTerminal(metadata.status)) await this.markFinalOutputPresented(metadata);
+		if (isTerminal(metadata.status)) await this.markTerminalPresented(metadata);
+		else if (ready) await this.markPresented(metadata, "ready");
 		return { metadata, ...snapshot, ...(ready ? { ready: true } : {}) };
 	}
 
@@ -480,8 +481,14 @@ export class PythonRuntime {
 			await writeJsonAtomic(this.metaPath(id), metadata);
 		}
 		const { output, omittedBytes } = await this.snapshotOutput(id);
-		if (isTerminal(metadata.status)) await this.markFinalOutputPresented(metadata);
+		if (isTerminal(metadata.status)) await this.markTerminalPresented(metadata);
 		return { metadata, output, omittedBytes };
+	}
+
+	/** Persist suppression for a successful explicit result returned by the tool. */
+	async markResultPresented(result: TaskResult): Promise<void> {
+		if (isTerminal(result.metadata.status)) await this.markTerminalPresented(result.metadata);
+		else if (result.ready) await this.markPresented(result.metadata, "ready");
 	}
 
 	async listTasks(sessionId?: string): Promise<TaskMetadata[]> {
@@ -624,17 +631,24 @@ export class PythonRuntime {
 		return metadata;
 	}
 
-	private async markFinalOutputPresented(metadata: TaskMetadata): Promise<void> {
+	private async markPresented(metadata: TaskMetadata, kind: "ready" | "exit"): Promise<void> {
 		if (!metadata.instanceId) return;
 		const current = await this.readMetadata(metadata.id);
-		if (current.instanceId !== metadata.instanceId || !isTerminal(current.status)) return;
-		const path = join(this.directory(metadata.id), `${metadata.instanceId}.exit.presented`);
+		if (current.instanceId !== metadata.instanceId) return;
+		if (kind === "exit" && !isTerminal(current.status)) return;
+		if (kind === "ready" && !existsSync(this.readyMarkerPath(current))) return;
+		const path = join(this.directory(metadata.id), `${metadata.instanceId}.${kind}.presented`);
 		try {
 			const handle = await open(path, "wx");
 			await handle.close();
 		} catch (error) {
 			if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
 		}
+	}
+
+	private async markTerminalPresented(metadata: TaskMetadata): Promise<void> {
+		await this.markPresented(metadata, "exit");
+		if (existsSync(this.readyMarkerPath(metadata))) await this.markPresented(metadata, "ready");
 	}
 
 	private async snapshotOutput(id: string): Promise<{ output: string; omittedBytes: number }> {

@@ -8,8 +8,9 @@ import {
 	type Theme,
 } from "@earendil-works/pi-coding-agent";
 import { Container, Text, truncateToWidth } from "@earendil-works/pi-tui";
+import { registerTaskCoordinator } from "@4fu/pi-task-coordinator";
 import { loadConfig } from "./config.ts";
-import { TaskNotificationManager, registerTaskNotificationRenderer } from "./task-notifications.ts";
+import { TaskNotificationManager } from "./task-notifications.ts";
 import { PythonRuntime, type TaskResult } from "./runtime.ts";
 
 const TOOL_DESCRIPTION = `Start or inspect persistent Python 3 tasks in the current working directory.
@@ -206,7 +207,7 @@ function formatPythonCodeCall(args: PythonToolArgs, expanded: boolean, theme: Th
 	const rendered = cache?.highlightedLines ?? highlightCode(replaceTabs(normalizeDisplayText(code)), PYTHON_LANG);
 	const lines = trimTrailingEmptyLines(rendered);
 	const maxLines = expanded ? lines.length : CALL_COLLAPSED_CODE_LINES;
-	text += `\n\n${lines.slice(0, maxLines).join("\n")}`;
+	text += `\n${lines.slice(0, maxLines).join("\n")}`;
 	if (lines.length > maxLines) {
 		text += `${theme.fg("muted", `\n... (${lines.length - maxLines} more lines, ${lines.length} total,`)} ${keyHint("app.tools.expand", "to expand")}${theme.fg("muted", ")")}`;
 	}
@@ -276,7 +277,7 @@ function rebuildPythonResultComponent(
 	theme: Theme,
 ): void {
 	component.clear();
-	if (parts.header) component.addChild(new Text(`\n${parts.header}`, 0, 0));
+	if (parts.header) component.addChild(new Text(parts.header, 0, 0));
 
 	const output = parts.output.trim();
 	if (output) {
@@ -285,7 +286,7 @@ function rebuildPythonResultComponent(
 			.map((line) => theme.fg("toolOutput", line))
 			.join("\n");
 		if (options.expanded) {
-			component.addChild(new Text(`\n${styledOutput}`, 0, 0));
+			component.addChild(new Text(styledOutput, 0, 0));
 		} else {
 			const cache = component.previewCache;
 			component.addChild({
@@ -301,9 +302,9 @@ function rebuildPythonResultComponent(
 						const hint =
 							theme.fg("muted", `... (${cache.skippedCount} earlier lines,`) +
 							` ${keyHint("app.tools.expand", "to expand")}${theme.fg("muted", ")")}`;
-						return ["", truncateToWidth(hint, width, "..."), ...(cache.visualLines ?? [])];
+						return [truncateToWidth(hint, width, "..."), ...(cache.visualLines ?? [])];
 					}
-					return ["", ...(cache.visualLines ?? [])];
+					return cache.visualLines ?? [];
 				},
 				invalidate: () => {
 					cache.width = undefined;
@@ -314,8 +315,8 @@ function rebuildPythonResultComponent(
 		}
 	}
 
-	if (parts.note) component.addChild(new Text(`\n${theme.fg("warning", `[${parts.note}]`)}`, 0, 0));
-	if (parts.error) component.addChild(new Text(`\n${theme.fg("error", parts.error)}`, 0, 0));
+	if (parts.note) component.addChild(new Text(theme.fg("warning", `[${parts.note}]`), 0, 0));
+	if (parts.error) component.addChild(new Text(theme.fg("error", parts.error), 0, 0));
 }
 
 function assertValidCombination(params: {
@@ -340,6 +341,7 @@ function assertValidCombination(params: {
 }
 
 export default function pythonExtension(pi: ExtensionAPI): void {
+	const coordinator = registerTaskCoordinator(pi, "python");
 	let runtime: PythonRuntime | undefined;
 	let setupError: string | undefined;
 	let notifications: TaskNotificationManager | undefined;
@@ -353,8 +355,6 @@ export default function pythonExtension(pi: ExtensionAPI): void {
 	} catch (error) {
 		setupError = error instanceof Error ? error.message : String(error);
 	}
-	registerTaskNotificationRenderer(pi);
-
 	pi.registerTool({
 		name: "python",
 		label: "Python",
@@ -371,13 +371,16 @@ export default function pythonExtension(pi: ExtensionAPI): void {
 			assertValidCombination(params);
 			if (!runtime) throw new Error(`python: ${setupError ?? "runtime configuration could not be loaded"}`);
 			const activeRuntime = runtime;
-			const releaseNotifications = notifications?.deferDuringToolCall() ?? (() => {});
+			let releaseHold = params.taskId !== undefined
+				? notifications?.holdTask(params.taskId) ?? (() => {})
+				: notifications?.holdSource() ?? (() => {});
 			try {
-
 				if (params.taskId !== undefined) {
 					const result = params.stop
 						? await activeRuntime.stopTask(params.taskId)
 						: await activeRuntime.readTask(params.taskId, params.wait ?? 0, signal);
+					await activeRuntime.markResultPresented(result);
+					notifications?.withdrawPresented(result);
 					return {
 						content: [{ type: "text" as const, text: taskText(result) }],
 						details: detailsForTask(result),
@@ -385,15 +388,20 @@ export default function pythonExtension(pi: ExtensionAPI): void {
 				}
 
 				const metadata = await activeRuntime.startTask(params.code as string, ctx.cwd, params.notifyOn);
+				const releaseSource = releaseHold;
+				releaseHold = notifications?.holdTask(metadata.id) ?? (() => {});
+				releaseSource();
 				const result = params.wait !== undefined
 					? await activeRuntime.waitForTask(metadata.id, params.wait, signal)
-					: { metadata, output: "", omittedBytes: 0 };
+					: await activeRuntime.readTask(metadata.id, 0);
+				await activeRuntime.markResultPresented(result);
+				notifications?.withdrawPresented(result);
 				return {
 					content: [{ type: "text" as const, text: taskText(result) }],
 					details: detailsForTask(result),
 				};
 			} finally {
-				releaseNotifications();
+				releaseHold();
 			}
 		},
 
@@ -461,24 +469,28 @@ export default function pythonExtension(pi: ExtensionAPI): void {
 		const current = notifications;
 		notifications = undefined;
 		await current?.close();
+		coordinator.closeSession();
 	});
 
 	pi.on("session_start", async (_event, ctx) => {
 		const current = notifications;
 		notifications = undefined;
 		await current?.close();
+		coordinator.closeSession();
 		if (!runtime) {
 			ctx.ui.notify(`pi-python: ${setupError ?? "runtime configuration could not be loaded"}`, "error");
 			return;
 		}
 		runtime.setSessionId(ctx.sessionManager.getSessionId());
+		coordinator.startSession(ctx, ctx.sessionManager.getSessionId());
 		try {
 			await Promise.all([runtime.cleanupExpired(), runtime.interpreter()]);
 		} catch (error) {
+			coordinator.closeSession();
 			ctx.ui.notify(`pi-python: ${error instanceof Error ? error.message : String(error)}`, "error");
 			return;
 		}
-		const manager = new TaskNotificationManager(pi, ctx, runtime, ctx.sessionManager.getSessionId());
+		const manager = new TaskNotificationManager(coordinator, runtime, ctx.sessionManager.getSessionId());
 		try {
 			await manager.start();
 			notifications = manager;

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { existsSync } from "node:fs";
-import { mkdir, mkdtemp, readFile, rm, utimes, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, stat, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { isAbsolute, join } from "node:path";
 import { describe, it } from "node:test";
@@ -16,6 +16,17 @@ async function waitForTerminal(runtime: PythonRuntime, id: string): Promise<Task
 		metadata = await runtime.getTaskMetadata(id);
 	}
 	return metadata;
+}
+
+class FakeCoordinator {
+	offers: Array<{ update: any; callbacks: any }> = [];
+	active: any[] = [];
+	withdrawals: any[] = [];
+	offer(update: any, callbacks: any) { this.offers.push({ update, callbacks }); }
+	updateActiveTasks(tasks: any[]) { this.active = tasks; }
+	holdTask() { return () => {}; }
+	holdSource() { return () => {}; }
+	withdrawTask(...args: any[]) { this.withdrawals.push(args); }
 }
 
 describe("configuration and runtime hardening", () => {
@@ -129,37 +140,12 @@ describe("durable task notifications", () => {
 		}
 	});
 
-	it("reports readiness and completion once, isolates session metadata, and updates the widget", async () => {
+	it("offers current-session readiness and terminal events with durable lifecycle callbacks", async () => {
 		const taskDir = await mkdtemp(join(tmpdir(), "pi-python-notify-"));
-		const messages: Array<{ message: any; options: any }> = [];
-		const widgets: Array<{ key: string; content: unknown; options: unknown }> = [];
-		const pi = { sendMessage: (message: any, options: any) => messages.push({ message, options }) };
-		const ctx = {
-			mode: "rpc",
-			hasUI: true,
-			ui: { setWidget: (key: string, content: unknown, options: unknown) => widgets.push({ key, content, options }) },
-		};
+		const coordinator = new FakeCoordinator();
 		const runtime = new PythonRuntime({ taskDir, sessionId: "session-a" });
-		const manager = new TaskNotificationManager(pi as any, ctx as any, runtime, "session-a", {
-			pollIntervalMs: 0,
-			batchIntervalMs: 60_000,
-		});
+		const manager = new TaskNotificationManager(coordinator as any, runtime, "session-a", { pollIntervalMs: 0 });
 		try {
-			const malformedDirectory = join(taskDir, "py_deadbeef");
-			await mkdir(malformedDirectory);
-			const malformedTime = new Date().toISOString();
-			await writeFile(join(malformedDirectory, "meta.json"), JSON.stringify({
-				version: 2,
-				id: "py_deadbeef",
-				instanceId: "d".repeat(32),
-				sessionId: "session-a",
-				supervisorPid: process.pid,
-				cwd: process.cwd(),
-				createdAt: malformedTime,
-				updatedAt: malformedTime,
-				status: "running",
-				notifyOn: 42,
-			}));
 			await manager.start();
 			const task = await runtime.startTask(
 				"import time\nprint('Listening on 4321', flush=True)\ntime.sleep(0.4)\nprint('done', flush=True)",
@@ -171,100 +157,95 @@ describe("durable task notifications", () => {
 			assert.match(task.instanceId ?? "", /^[0-9a-f]{32}$/);
 
 			const deadline = Date.now() + 5000;
-			while (!messages.some(({ message }) => message.details.tasks.some((detail: any) => detail.kind === "ready")) && Date.now() < deadline) {
+			while (!coordinator.offers.some(({ update }) => update.event === "ready") && Date.now() < deadline) {
 				await manager.scanNow();
-				await manager.flushNow();
 				await new Promise((resolve) => setTimeout(resolve, 50));
 			}
-			const ready = messages.find(({ message }) => message.details.tasks.some((detail: any) => detail.kind === "ready"));
+			const ready = coordinator.offers.find(({ update }) => update.event === "ready");
 			assert.ok(ready);
-			assert.deepEqual(ready.options, { deliverAs: "steer", triggerTurn: true });
-			assert.match(ready.message.content, /TASK DATA/);
-			assert.ok(widgets.some(({ content }) => Array.isArray(content) && /^py_/.test(String(content[0]))));
+			assert.equal(ready.update.eventId, `python:${task.instanceId}:ready`);
+			assert.equal(ready.update.taskKey, `python:${task.id}`);
+			assert.equal(ready.update.source, "python");
+			assert.ok(ready.update.output.length <= 4_000);
+			const readyClaim = join(runtime.taskDirectoryPath(task.id), `${task.instanceId}.ready.notifying`);
+			const readySubmitted = join(runtime.taskDirectoryPath(task.id), `${task.instanceId}.ready.submitted`);
+			await ready.callbacks.onSubmitted("delivery");
+			assert.equal(existsSync(readyClaim), false);
+			assert.equal(existsSync(readySubmitted), true);
 
-			while (!messages.some(({ message }) => message.details.tasks.some((detail: any) => detail.kind === "exit")) && Date.now() < deadline) {
+			while (!coordinator.offers.some(({ update }) => update.event === "terminal") && Date.now() < deadline) {
 				await manager.scanNow();
-				await manager.flushNow();
 				await new Promise((resolve) => setTimeout(resolve, 50));
 			}
-			const exit = messages.find(({ message }) => message.details.tasks.some((detail: any) => detail.kind === "exit"));
-			assert.ok(exit);
-			assert.equal(exit.message.details.tasks[0].status, "completed");
-			assert.match(exit.message.details.tasks[0].output, /done/);
-			const manuallyRead = await runtime.readTask(task.id);
-			assert.match(manuallyRead.output, /Listening on 4321/);
-			assert.match(manuallyRead.output, /done/);
-			const delivered = messages.length;
+			const terminal = coordinator.offers.find(({ update }) => update.event === "terminal");
+			assert.ok(terminal);
+			assert.equal(terminal.update.status, "completed");
+			assert.match(terminal.update.output, /done/);
+			await terminal.callbacks.onSubmitted("delivery");
+			await terminal.callbacks.onDelivered("delivery");
+			assert.equal(existsSync(join(runtime.taskDirectoryPath(task.id), `${task.instanceId}.exit.notified`)), true);
+			await ready.callbacks.onWithdrawn("superseded");
+			assert.equal(existsSync(readySubmitted), false);
+			assert.equal(existsSync(join(runtime.taskDirectoryPath(task.id), `${task.instanceId}.ready.notified`)), true);
+			const offered = coordinator.offers.length;
 			await manager.scanNow();
-			await manager.flushNow();
-			assert.equal(messages.length, delivered);
-
-			await manager.close();
-			const resumed = new TaskNotificationManager(pi as any, ctx as any, runtime, "session-a", {
-				pollIntervalMs: 0,
-				batchIntervalMs: 60_000,
-			});
+			assert.equal(coordinator.offers.length, offered);
+			const resumedCoordinator = new FakeCoordinator();
+			const resumed = new TaskNotificationManager(resumedCoordinator as any, runtime, "session-a", { pollIntervalMs: 0 });
 			await resumed.start();
-			await resumed.flushNow();
-			assert.equal(messages.length, delivered);
+			assert.equal(resumedCoordinator.offers.length, 0);
 			await resumed.close();
-			assert.equal(widgets.at(-1)?.content, undefined);
 		} finally {
 			await manager.close();
 			await rm(taskDir, { recursive: true, force: true });
 		}
 	});
 
-	it("does not repeat final output when a manual read wins the delivery race", async () => {
+	it("skips explicitly presented readiness and terminal events", async () => {
 		const taskDir = await mkdtemp(join(tmpdir(), "pi-python-notify-race-"));
-		const messages: Array<{ message: any; options: any }> = [];
-		const pi = { sendMessage: (message: any, options: any) => messages.push({ message, options }) };
-		const ctx = { mode: "print", hasUI: false, ui: { setWidget() {} } };
+		const coordinator = new FakeCoordinator();
 		const runtime = new PythonRuntime({ taskDir, sessionId: "session-race" });
-		const manager = new TaskNotificationManager(pi as any, ctx as any, runtime, "session-race", {
-			pollIntervalMs: 0,
-			batchIntervalMs: 60_000,
-		});
+		const manager = new TaskNotificationManager(coordinator as any, runtime, "session-race", { pollIntervalMs: 0 });
 		try {
 			await manager.start();
-			const task = await runtime.startTask("print('final output', flush=True)", process.cwd());
-			const metadata = await waitForTerminal(runtime, task.id);
-			assert.equal(metadata.status, "completed");
-
-			const release = manager.deferDuringToolCall();
+			const task = await runtime.startTask("print('READY', flush=True)\nimport time; time.sleep(.2)", process.cwd(), "READY");
+			const result = await runtime.readTask(task.id, 2);
+			assert.equal(result.ready, true);
+			assert.equal(existsSync(join(runtime.taskDirectoryPath(task.id), `${task.instanceId}.ready.presented`)), true);
 			await manager.scanNow();
-			await manager.flushNow();
-			assert.equal(messages.length, 0);
-			const result = await runtime.readTask(task.id);
-			assert.match(result.output, /final output/);
+			assert.equal(coordinator.offers.some(({ update }) => update.event === "ready"), false);
+			await waitForTerminal(runtime, task.id);
+			await runtime.readTask(task.id);
 			assert.equal(existsSync(join(runtime.taskDirectoryPath(task.id), `${task.instanceId}.exit.presented`)), true);
-			release();
-			await manager.flushNow();
-			assert.equal(messages.length, 1);
-			assert.equal(messages[0].message.details.tasks[0].outputAlreadyReceived, true);
-			assert.equal(messages[0].message.details.tasks[0].output, "");
-			assert.doesNotMatch(messages[0].message.content, /final output/);
+			await manager.scanNow();
+			assert.equal(coordinator.offers.length, 0);
 		} finally {
 			await manager.close();
 			await rm(taskDir, { recursive: true, force: true });
 		}
 	});
 
-	it("retries failed delivery and recovers an expired notification lease", async () => {
+	it("waits for an in-flight scan to stop before session shutdown completes", async () => {
+		const coordinator = new FakeCoordinator();
+		let releaseList!: (tasks: TaskMetadata[]) => void;
+		const runtime = {
+			listTasks: () => new Promise<TaskMetadata[]>((resolve) => { releaseList = resolve; }),
+			taskDirectoryPath: () => "/unused",
+		};
+		const manager = new TaskNotificationManager(coordinator as any, runtime as any, "session-old", { pollIntervalMs: 0 });
+		const starting = manager.start();
+		const closing = manager.close();
+		releaseList([]);
+		await Promise.all([starting, closing]);
+		assert.equal(coordinator.offers.length, 0);
+		assert.deepEqual(coordinator.active, []);
+	});
+
+	it("recovers expired pre-submission and submitted leases without re-offering fresh submission", async () => {
 		const taskDir = await mkdtemp(join(tmpdir(), "pi-python-notify-lease-"));
-		let attempts = 0;
-		const messages: unknown[] = [];
-		const pi = { sendMessage: (message: unknown) => {
-			attempts++;
-			if (attempts === 1) throw new Error("injected send failure");
-			messages.push(message);
-		} };
-		const ctx = { mode: "print", hasUI: false, ui: { setWidget() {} } };
+		const coordinator = new FakeCoordinator();
 		const runtime = new PythonRuntime({ taskDir, sessionId: "session-lease" });
-		const manager = new TaskNotificationManager(pi as any, ctx as any, runtime, "session-lease", {
-			pollIntervalMs: 0,
-			batchIntervalMs: 60_000,
-		});
+		const manager = new TaskNotificationManager(coordinator as any, runtime, "session-lease", { pollIntervalMs: 0 });
 		try {
 			await manager.start();
 			const task = await runtime.startTask("print('done', flush=True)", process.cwd());
@@ -274,13 +255,21 @@ describe("durable task notifications", () => {
 			const stale = new Date(Date.now() - 60_000);
 			await utimes(lease, stale, stale);
 			await manager.scanNow();
-			await manager.flushNow();
-			assert.equal(attempts, 1);
-			assert.equal(existsSync(lease), false);
-			await manager.flushNow();
-			assert.equal(attempts, 2);
-			assert.equal(messages.length, 1);
-			assert.equal(existsSync(join(runtime.taskDirectoryPath(task.id), `${task.instanceId}.exit.notified`)), true);
+			assert.equal(coordinator.offers.length, 1);
+			await coordinator.offers[0].callbacks.onSubmitted("delivery");
+			const submitted = join(runtime.taskDirectoryPath(task.id), `${task.instanceId}.exit.submitted`);
+			await utimes(submitted, stale, stale);
+			await coordinator.offers[0].callbacks.onSubmitted("delivery-retry");
+			assert.ok(Date.now() - (await stat(submitted)).mtimeMs < 1_000);
+			await manager.close();
+			const resumedCoordinator = new FakeCoordinator();
+			const resumed = new TaskNotificationManager(resumedCoordinator as any, runtime, "session-lease", { pollIntervalMs: 0 });
+			await resumed.start();
+			assert.equal(resumedCoordinator.offers.length, 0);
+			await utimes(submitted, stale, stale);
+			await resumed.scanNow();
+			assert.equal(resumedCoordinator.offers.length, 1);
+			await resumed.close();
 		} finally {
 			await manager.close();
 			await rm(taskDir, { recursive: true, force: true });
