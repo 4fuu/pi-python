@@ -359,9 +359,9 @@ export default function pythonExtension(pi: ExtensionAPI): void {
 		name: "python",
 		label: "Python",
 		description: TOOL_DESCRIPTION,
-		promptSnippet: "Start, query, wait for, receive notifications from, or stop persistent Python tasks",
+		promptSnippet: "Execute Python scripts",
 		promptGuidelines: [
-			"Start with code; query or wait with taskId; notifyOn reports literal readiness; only stop=true terminates a task.",
+			"Use python for complex tasks and computation; every code execution starts a persistent background task.",
 		],
 		parameters: PythonParams,
 		executionMode: "sequential",

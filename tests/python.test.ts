@@ -44,9 +44,9 @@ describe("python extension", () => {
 	it("registers concise prompt metadata and the intended flat schema", () => {
 		const { tool, renderers } = createHarness();
 		assert.equal(tool.name, "python");
-		assert.equal(tool.promptSnippet, "Start, query, wait for, receive notifications from, or stop persistent Python tasks");
+		assert.equal(tool.promptSnippet, "Execute Python scripts");
 		assert.deepEqual(tool.promptGuidelines, [
-			"Start with code; query or wait with taskId; notifyOn reports literal readiness; only stop=true terminates a task.",
+			"Use python for complex tasks and computation; every code execution starts a persistent background task.",
 		]);
 		assert.deepEqual(Object.keys(tool.parameters.properties), ["code", "notifyOn", "taskId", "wait", "stop"]);
 		assert.equal(tool.executionMode, "sequential");
