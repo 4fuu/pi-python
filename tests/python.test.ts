@@ -17,6 +17,7 @@ function createHarness() {
 		events: {
 			on(name: string, handler: (event: unknown) => void) {
 				eventHandlers.set(name, [...(eventHandlers.get(name) ?? []), handler]);
+				return () => eventHandlers.set(name, (eventHandlers.get(name) ?? []).filter((candidate) => candidate !== handler));
 			},
 			emit(name: string, event: unknown) {
 				for (const handler of eventHandlers.get(name) ?? []) handler(event);
@@ -25,6 +26,7 @@ function createHarness() {
 		registerTool(definition: Record<string, any>) {
 			tool = definition;
 		},
+		registerCommand() {},
 		registerMessageRenderer(name: string, renderer: (...args: any[]) => unknown) {
 			renderers.set(name, renderer);
 		},

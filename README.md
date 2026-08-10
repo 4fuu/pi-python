@@ -28,7 +28,7 @@ The returned task ID lets the model inspect the latest snapshot, wait again, or 
 
 Readiness, completion, failure, and cancellation are reported automatically. Notification state is durable and deduplicated, and notifications aggregate with other installed `@4fu` background-task plugins. Explicitly retrieving a ready or terminal result cancels its pending notification.
 
-Tool rows use a compact contiguous layout with Python syntax highlighting, ANSI-safe output previews, duration, and expandable details. Active tasks share the background-task widget with other installed `@4fu` task plugins.
+Tool rows use a compact contiguous layout with Python syntax highlighting, ANSI-safe output previews, duration, and expandable details. Active tasks share the Tasks widget with other installed `@4fu` task plugins; `/tasks` shows active and recently retained terminal tasks. Upgrade related task plugins together so they use compatible shared task presentation packages.
 
 ## Configuration
 

@@ -10,6 +10,7 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { Container, Text, truncateToWidth } from "@earendil-works/pi-tui";
 import { registerTaskCoordinator } from "@4fu/pi-task-coordinator";
+import { registerTaskReporter } from "@4fu/pi-tasks";
 import { loadConfig } from "./config.ts";
 import { TaskNotificationManager } from "./task-notifications.ts";
 import { PythonRuntime, type TaskResult } from "./runtime.ts";
@@ -353,6 +354,7 @@ function assertValidCombination(params: {
 }
 
 export default function pythonExtension(pi: ExtensionAPI): void {
+	const reporter = registerTaskReporter(pi, "python");
 	const coordinator = registerTaskCoordinator(pi, "python");
 	let runtime: PythonRuntime | undefined;
 	let setupError: string | undefined;
@@ -512,7 +514,7 @@ export default function pythonExtension(pi: ExtensionAPI): void {
 			ctx.ui.notify(`pi-python: ${error instanceof Error ? error.message : String(error)}`, "error");
 			return;
 		}
-		const manager = new TaskNotificationManager(coordinator, runtime, ctx.sessionManager.getSessionId());
+		const manager = new TaskNotificationManager(coordinator, reporter, runtime, ctx.sessionManager.getSessionId());
 		try {
 			await manager.start();
 			notifications = manager;

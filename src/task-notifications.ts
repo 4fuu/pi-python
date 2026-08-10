@@ -3,6 +3,7 @@ import { randomUUID } from "node:crypto";
 import { open, readFile, rename, rm, stat, utimes } from "node:fs/promises";
 import { join } from "node:path";
 import type { TaskCoordinator, TaskNotificationKind, TaskWithdrawalReason } from "@4fu/pi-task-coordinator";
+import type { PresentedTask, TaskReporter } from "@4fu/pi-tasks";
 import { PythonRuntime, type TaskMetadata } from "./runtime.ts";
 
 const DEFAULT_POLL_INTERVAL_MS = 400;
@@ -41,6 +42,7 @@ function isNotificationTask(metadata: TaskMetadata, sessionId: string): metadata
 /** Observes persistent tasks; the shared coordinator owns presentation only. */
 export class TaskNotificationManager {
 	private readonly coordinator: TaskCoordinator;
+	private readonly reporter: TaskReporter;
 	private readonly runtime: PythonRuntime;
 	private readonly sessionId: string;
 	private readonly offered = new Set<string>();
@@ -51,11 +53,13 @@ export class TaskNotificationManager {
 
 	constructor(
 		coordinator: TaskCoordinator,
+		reporter: TaskReporter,
 		runtime: PythonRuntime,
 		sessionId: string,
 		options: TaskNotificationOptions = {},
 	) {
 		this.coordinator = coordinator;
+		this.reporter = reporter;
 		this.runtime = runtime;
 		this.sessionId = sessionId;
 		this.pollIntervalMs = options.pollIntervalMs ?? DEFAULT_POLL_INTERVAL_MS;
@@ -82,7 +86,7 @@ export class TaskNotificationManager {
 		this.pollTimer = undefined;
 		await this.scanPromise?.catch(() => {});
 		this.offered.clear();
-		this.coordinator.updateActiveTasks([]);
+		this.reporter.publishCatalog(this.sessionId, []);
 	}
 
 	holdTask(taskId: string): () => void {
@@ -131,13 +135,29 @@ export class TaskNotificationManager {
 			}
 		}
 		if (this.closed) return;
-		this.coordinator.updateActiveTasks(tasks
-			.filter((task) => task.status === "starting" || task.status === "running")
-			.map((task) => ({
-				taskKey: `python:${task.id}`, source: "python", taskId: task.id,
-				status: existsSync(join(this.runtime.taskDirectoryPath(task.id), `${task.instanceId}.ready.detected`)) ? "ready" : task.status,
-				startedAt: Date.parse(task.createdAt), summary: (task.codeSummary ?? "(source unavailable)").slice(0, 500),
-			})));
+		this.reporter.publishCatalog(this.sessionId, tasks.map((task): PresentedTask => {
+			const active = task.status === "starting" || task.status === "running";
+			const phase: PresentedTask["phase"] = active ? "active"
+				: task.status === "completed" ? "completed"
+				: task.status === "failed" ? "failed"
+				: "cancelled";
+			const createdAt = Date.parse(task.createdAt);
+			const updatedAt = Date.parse(task.updatedAt);
+			return {
+				taskKey: `python:${task.id}`,
+				source: "python",
+				taskId: task.id,
+				phase,
+				statusLabel: active && existsSync(join(this.runtime.taskDirectoryPath(task.id), `${task.instanceId}.ready.detected`))
+					? "ready"
+					: task.status,
+				createdAt,
+				updatedAt,
+				startedAt: createdAt,
+				...(active ? {} : { endedAt: updatedAt }),
+				summary: task.codeSummary ?? "(source unavailable)",
+			};
+		}));
 	}
 
 	private async scanReady(task: NotificationTask): Promise<void> {
