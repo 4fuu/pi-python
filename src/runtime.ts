@@ -42,6 +42,7 @@ export interface TaskMetadata {
 	status: TaskStatus;
 	exitCode?: number | null;
 	error?: string;
+	failureKind?: "infrastructure";
 }
 
 export interface TaskResult {
@@ -249,6 +250,7 @@ function parseTaskMetadata(value: unknown, id: string): TaskMetadata {
 	if (typeof input.status !== "string" || !TASK_STATUSES.has(input.status as TaskStatus)) throw new Error("invalid status");
 	if (input.exitCode !== undefined && input.exitCode !== null && !Number.isInteger(input.exitCode)) throw new Error("invalid exit code");
 	if (input.error !== undefined && typeof input.error !== "string") throw new Error("invalid error");
+	if (input.failureKind !== undefined && input.failureKind !== "infrastructure") throw new Error("invalid failure kind");
 	{
 		if (typeof input.instanceId !== "string" || !/^[0-9a-f]{32}$/i.test(input.instanceId)) throw new Error("invalid instance ID");
 		if (typeof input.sessionId !== "string") throw new Error("invalid session ID");
@@ -328,6 +330,7 @@ export class PythonRuntime {
 		const logPath = join(directory, "output.log");
 		const metaPath = join(directory, "meta.json");
 		const configPath = join(directory, "config.json");
+		const cancelMarkerPath = join(directory, `${instanceId}.cancelled`);
 		const now = new Date().toISOString();
 		const initial: TaskMetadata = {
 			version: 2,
@@ -361,7 +364,7 @@ export class PythonRuntime {
 				metaPath,
 				notifyOn,
 				readyMarkerPath: join(directory, `${instanceId}.ready.detected`),
-				cancelMarkerPath: join(directory, `${instanceId}.cancelled`),
+				cancelMarkerPath,
 			});
 			const supervisor = spawn(process.execPath, [this.launcherPath, configPath], {
 				cwd,
@@ -409,11 +412,43 @@ export class PythonRuntime {
 				// Startup may have failed before metadata was fully created.
 			}
 			const ownedMetadata = metadata?.id === id && metadata.instanceId === instanceId ? metadata : undefined;
-			await killProcessTree(supervisorPid || ownedMetadata?.supervisorPid || 0);
-			if (process.platform === "win32" && ownedMetadata?.pid && isAlive(ownedMetadata.pid)) {
-				await killProcessTree(ownedMetadata.pid);
+			const startupMessage = error instanceof Error ? error.message : String(error);
+			const cleanupErrors: string[] = [];
+			try {
+				await writeFile(cancelMarkerPath, "", { flag: "a", mode: 0o600 });
+			} catch (cleanupError) {
+				cleanupErrors.push(`cancel marker: ${cleanupError instanceof Error ? cleanupError.message : String(cleanupError)}`);
 			}
-			await rm(directory, { recursive: true, force: true });
+			try {
+				await killProcessTree(supervisorPid || ownedMetadata?.supervisorPid || 0);
+				if (process.platform === "win32" && ownedMetadata?.pid && isAlive(ownedMetadata.pid)) {
+					await killProcessTree(ownedMetadata.pid);
+				}
+			} catch (cleanupError) {
+				cleanupErrors.push(`process cleanup: ${cleanupError instanceof Error ? cleanupError.message : String(cleanupError)}`);
+			}
+			const message = cleanupErrors.length > 0
+				? `${startupMessage}; cleanup failed (${cleanupErrors.join("; ")})`
+				: startupMessage;
+			const failed: TaskMetadata = {
+				...(ownedMetadata ?? initial),
+				supervisorPid: supervisorPid || ownedMetadata?.supervisorPid || 0,
+				updatedAt: new Date().toISOString(),
+				status: "failed",
+				exitCode: null,
+				error: message,
+				failureKind: "infrastructure",
+			};
+			// Once a task directory has been allocated it is a durable diagnostic record,
+			// even when startup failed before all normal files could be written.
+			await Promise.allSettled([
+				existsSync(codePath) ? Promise.resolve() : writeFile(codePath, code, { encoding: "utf8", mode: 0o600 }),
+				writeFile(logPath, `[pi-python startup failure] ${message}\n`, { encoding: "utf8", mode: 0o600, flag: "a" }),
+				existsSync(configPath) ? Promise.resolve() : writeJsonAtomic(configPath, { id, instanceId, cwd, codePath, logPath, metaPath }),
+				writeJsonAtomic(metaPath, failed),
+				writeFile(join(directory, `${instanceId}.exit.presented`), "", { flag: "a", mode: 0o600 }),
+			]);
+			if (existsSync(directory)) throw new Error(`${message}\ndiagnosticsPath: ${directory}`);
 			throw error;
 		}
 	}
@@ -476,6 +511,7 @@ export class PythonRuntime {
 				status: "cancelled",
 				exitCode: null,
 				error: undefined,
+				failureKind: undefined,
 				updatedAt: new Date().toISOString(),
 			};
 			await writeJsonAtomic(this.metaPath(id), metadata);
@@ -572,10 +608,11 @@ export class PythonRuntime {
 
 	private async readMetadata(id: string): Promise<TaskMetadata> {
 		this.assertTaskId(id);
+		const directory = this.directory(id);
 		try {
 			return parseTaskMetadata(JSON.parse(await readFile(this.metaPath(id), "utf8")), id);
 		} catch (error) {
-			throw new Error(`python: could not read persistent task "${id}": ${error instanceof Error ? error.message : String(error)}`);
+			throw new Error(`python: could not read persistent task "${id}": ${error instanceof Error ? error.message : String(error)}\ndiagnosticsPath: ${directory}`);
 		}
 	}
 
@@ -598,6 +635,7 @@ export class PythonRuntime {
 				status: "failed",
 				exitCode: null,
 				error: "Task supervisor did not finish starting",
+				failureKind: "infrastructure",
 				updatedAt: new Date().toISOString(),
 			};
 			const current = await this.readMetadata(id);
@@ -617,6 +655,7 @@ export class PythonRuntime {
 					status: "failed",
 					exitCode: null,
 					error: "Task supervisor exited without recording a final status",
+					failureKind: "infrastructure",
 					updatedAt: new Date().toISOString(),
 				};
 				const current = await this.readMetadata(id);

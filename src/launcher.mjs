@@ -119,7 +119,7 @@ child.once("spawn", () => {
 child.once("error", (error) => {
 	void (async () => {
 		try {
-			await writeMetadata({ status: "failed", exitCode: null, error: error.message });
+			await writeMetadata({ status: "failed", exitCode: null, error: error.message, failureKind: "infrastructure" });
 		} catch {
 			process.exitCode = 1;
 		} finally {

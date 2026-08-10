@@ -1,3 +1,4 @@
+import { existsSync } from "node:fs";
 import { Type } from "typebox";
 import {
 	getAgentDir,
@@ -64,26 +65,35 @@ interface PythonDetails {
 	createdAt: string;
 	ready: boolean;
 	omittedBytes: number;
+	output?: string;
 	error?: string;
+	diagnosticsPath?: string;
 }
 
-function taskText(result: TaskResult): string {
+function taskDiagnosticsPath(result: TaskResult, runtime: PythonRuntime): string | undefined {
+	if (result.metadata.failureKind !== "infrastructure") return undefined;
+	const path = runtime.taskDirectoryPath(result.metadata.id);
+	return existsSync(path) ? path : undefined;
+}
+
+function taskText(result: TaskResult, diagnosticsPath?: string): string {
 	const { metadata } = result;
+	const output = result.output.replace(/\s+$/, "");
 	const lines = [
 		`taskId: ${metadata.id}`,
 		`status: ${metadata.status}`,
-		...(result.ready ? ["ready: true"] : []),
-		...(metadata.pid ? [`pid: ${metadata.pid}`] : []),
-		...(metadata.exitCode !== undefined ? [`exitCode: ${metadata.exitCode ?? "unknown"}`] : []),
+		...(result.ready && (metadata.status === "starting" || metadata.status === "running") ? ["ready: true"] : []),
+		...(metadata.status === "failed" && metadata.exitCode !== 0 ? [`exitCode: ${metadata.exitCode ?? "unknown"}`] : []),
 	];
 	if (result.omittedBytes > 0) lines.push(`output: [${result.omittedBytes} earlier bytes omitted]`);
-	else lines.push("output:");
-	lines.push(result.output ? result.output.replace(/\s+$/, "") : "(no output)");
+	else if (output) lines.push("output:");
+	if (output) lines.push(output);
 	if (metadata.error) lines.push(`error: ${metadata.error}`);
+	if (diagnosticsPath) lines.push(`diagnosticsPath: ${diagnosticsPath}`);
 	return lines.join("\n");
 }
 
-function detailsForTask(result: TaskResult): PythonDetails {
+function detailsForTask(result: TaskResult, diagnosticsPath?: string): PythonDetails {
 	return {
 		version: 1,
 		kind: "task",
@@ -94,7 +104,9 @@ function detailsForTask(result: TaskResult): PythonDetails {
 		createdAt: result.metadata.createdAt,
 		ready: !!result.ready,
 		omittedBytes: result.omittedBytes,
+		output: result.output,
 		error: result.metadata.error,
+		diagnosticsPath,
 	};
 }
 
@@ -242,7 +254,7 @@ function resultText(result: { content: Array<{ type: string; text?: string }> })
 function extractTaskBody(text: string): { note?: string; body: string } {
 	const lines = text.split("\n");
 	const markerIndex = lines.findIndex((line) => line === "output:" || line.startsWith("output: ["));
-	if (markerIndex === -1) return { body: text };
+	if (markerIndex === -1) return { body: "" };
 	const marker = lines[markerIndex];
 	const note = marker.startsWith("output: [") ? marker.slice("output: [".length, -1) : undefined;
 	return { note, body: lines.slice(markerIndex + 1).join("\n") };
@@ -381,9 +393,10 @@ export default function pythonExtension(pi: ExtensionAPI): void {
 						: await activeRuntime.readTask(params.taskId, params.wait ?? 0, signal);
 					await activeRuntime.markResultPresented(result);
 					notifications?.withdrawPresented(result);
+					const diagnosticsPath = taskDiagnosticsPath(result, activeRuntime);
 					return {
-						content: [{ type: "text" as const, text: taskText(result) }],
-						details: detailsForTask(result),
+						content: [{ type: "text" as const, text: taskText(result, diagnosticsPath) }],
+						details: detailsForTask(result, diagnosticsPath),
 					};
 				}
 
@@ -396,9 +409,10 @@ export default function pythonExtension(pi: ExtensionAPI): void {
 					: await activeRuntime.readTask(metadata.id, 0);
 				await activeRuntime.markResultPresented(result);
 				notifications?.withdrawPresented(result);
+				const diagnosticsPath = taskDiagnosticsPath(result, activeRuntime);
 				return {
-					content: [{ type: "text" as const, text: taskText(result) }],
-					details: detailsForTask(result),
+					content: [{ type: "text" as const, text: taskText(result, diagnosticsPath) }],
+					details: detailsForTask(result, diagnosticsPath),
 				};
 			} finally {
 				releaseHold();
@@ -453,11 +467,19 @@ export default function pythonExtension(pi: ExtensionAPI): void {
 				const duration = formatDuration(Math.max(0, Date.now() - Date.parse(details.createdAt)));
 				header = taskStatusHeader(details, duration, options.expanded, theme);
 				const extracted = extractTaskBody(output);
-				note = extracted.note;
-				output = extracted.body;
+				note = details.omittedBytes > 0 ? `${details.omittedBytes} earlier bytes omitted` : extracted.note;
+				const usesStructuredOutput = details.output !== undefined;
+				output = usesStructuredOutput ? sanitizeOutput(details.output ?? "") : extracted.body;
 				error = details.error;
-				if (error && output.endsWith(`\nerror: ${error}`)) output = output.slice(0, -(`\nerror: ${error}`).length);
-				if ((details.status === "starting" || details.status === "running") && output.trim() === "(no output)") output = "";
+				if (!usesStructuredOutput && error) {
+					const diagnosticSuffix = details.diagnosticsPath ? `\ndiagnosticsPath: ${details.diagnosticsPath}` : "";
+					const suffix = `\nerror: ${error}${diagnosticSuffix}`;
+					if (output.endsWith(suffix)) output = output.slice(0, -suffix.length);
+				}
+				if (details.status !== "starting" && details.status !== "running" && output.trim() === "") output = "(no output)";
+				if (details.diagnosticsPath && (options.expanded || details.status === "failed")) {
+					error = `${error ?? "Infrastructure failure"}\nDiagnostics: ${details.diagnosticsPath}`;
+				}
 			}
 			const component = (context.lastComponent as PythonResultComponent | undefined) ?? new PythonResultComponent();
 			rebuildPythonResultComponent(component, { header, output, note, error }, options, theme);
