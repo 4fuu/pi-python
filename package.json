@@ -1,6 +1,6 @@
 {
   "name": "@4fu/pi-python",
-  "version": "0.4.9",
+  "version": "0.4.10",
   "description": "Execute Python code in pi as persistent background tasks",
   "license": "MIT",
   "author": "4fuu",
@@ -34,7 +34,7 @@
     "test": "node --test tests/*.test.ts"
   },
   "dependencies": {
-    "@4fu/pi-task-coordinator": "0.2.0",
+    "@4fu/pi-task-coordinator": "0.2.1",
     "@4fu/pi-tasks": "0.1.2"
   },
   "peerDependencies": {
